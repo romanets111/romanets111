@@ -15,7 +15,7 @@ def get_moscow_time():
     return datetime.now(MSK_TZ)
 
 # Проверяем токен
-token = "vk1.a.BD8yNPKHpTb6W0_QHq-hNpmNVjfnT0eKhexRxhkmLIQhVzPU6ULHqkcA7h5ptN03ieLd8cUKC1Mml3kN8gZpiJw4O9O7te90aVE48v55oMqV9c1EPkY6LFULpxOVj6eZqP31qplRvr9-I1TBVoquaWbv_R1NvTcm2O-eutLw7183g1RkKiUjl3Ng8RIHL1o78yAzg8rDRDEwQAsUWym2aA"
+token = "-"
 if not token:
     print("❌ ОШИБКА: VK_BOT_TOKEN не найден в переменных окружения!")
     print("Добавьте токен в Secrets (замочек в левой панели)")
@@ -3309,5 +3309,6 @@ if __name__ == "__main__":
 
     # Добавляем задачи запуска
     bot.loop_wrapper.on_startup.append(on_startup())
+
 
     bot.run_forever()

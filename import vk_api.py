@@ -1,681 +1,3387 @@
-import vk_api
-import time
-from datetime import datetime
-import threading
-import json
+import sqlite3
 import os
-import logging
-import asyncio
-from telegram.ext import Application, CommandHandler, ContextTypes
-from telegram import Update, Bot
-from telegram.constants import ParseMode
 import re
+from datetime import datetime, timezone, timedelta
+from vkbottle.bot import BotLabeler, Message
+from vkbottle import Bot
+from vkbottle.bot import rules
+from vkbottle import BaseStateGroup
 
-# Настройки логирования
-logging.basicConfig(
-    format="%(asctime)s - %(name)s - %(levelname)s - %(message)s", level=logging.INFO
-)
-logging.getLogger("httpx").setLevel(logging.WARNING)
-logger = logging.getLogger(__name__)
+# Московский часовой пояс
+MSK_TZ = timezone(timedelta(hours=3))
 
+def get_moscow_time():
+    """Получить текущее время в московском часовом поясе"""
+    return datetime.now(MSK_TZ)
 
-# ГЛОБАЛЬНЫЕ НАСТРОЙКИ
-TG_BOT_TOKEN = "8256738732:AAFNvz4ZO5822qNYJvYnu3kV7nbWcxRNRfQ"
-ADMIN_CHAT_ID = 1078972723 # Ваш Telegram ID
+# Проверяем токен
+token = "vk1.a.BD8yNPKHpTb6W0_QHq-hNpmNVjfnT0eKhexRxhkmLIQhVzPU6ULHqkcA7h5ptN03ieLd8cUKC1Mml3kN8gZpiJw4O9O7te90aVE48v55oMqV9c1EPkY6LFULpxOVj6eZqP31qplRvr9-I1TBVoquaWbv_R1NvTcm2O-eutLw7183g1RkKiUjl3Ng8RIHL1o78yAzg8rDRDEwQAsUWym2aA"
+if not token:
+    print("❌ ОШИБКА: VK_BOT_TOKEN не найден в переменных окружения!")
+    print("Добавьте токен в Secrets (замочек в левой панели)")
+    exit(1)
 
-USERS_CONFIG = {
-    "USER1": {
-        "TOKEN": "vk1.a.jbwK6GFMSysGLmhUvcUuvU2E5l3Fe8C1BgsD3QjgFN-hzCK22EPwFDzGEAprjQ0UZDjmZB2a_UUMUwI0aq5TzFz22-FgEbRQDvwu35Ij7MiGpQaXTdKip-ubgThRkBfcmH89Ewg4qg8H_wp0OClS6fZQm2lCo_jdejXl9frYe40BZFrpFoFMLMyCxN_kyj2ypmiWombbLhZ6Bpxy1v5vDQ",
-        "ALLOWED_CONFS": [
-            2000000038, 2000000042, 2000000079,
-            2000000043, 2000000085,
-            2000000070,
-            2000000078, 2000000071, 2000000037,
-            2000000004, 2000000039, 2000000090
-        ],
-        "AUTO_REPLY_ENABLED": True,
-        "AUTO_REPLY_CONF": 2000000040,
-        "TRIGGER_KEYWORDS": ["/offjail", "/gunban", "/offban", "/mute", "v_mute", "/offwarn", "/fmute"],
-        "ALLOWED_USER_IDS": [178936944, 539424038, 662975714, 90142259, 579184633, 408471417],
-    },
-    "USER2": {
-        "TOKEN": "vk1.a.kEIwbZeJL7UHs4gJQhq6_FoMbRBIj8i8cjprPPDtunaMn3LI42x0cFeGmg_9E0PSYoxebvCI30KyY6s5AKwZ9gMITyJX4-5G7N9LC9o5KC48ra2C6Hay81MMl33wrrN86OOGHcMRVlBD2-RvgAtTglsUiW1zBNW33OnzXKbdOAzfcJROTyUOH8WKtMB9g7KzsfT_B8I9Hg4AP0pkhQw3tA",
-        "ALLOWED_CONFS": [2000000074],
-        "AUTO_REPLY_ENABLED": False,
-        "AUTO_REPLY_CONF": None,
-        "TRIGGER_KEYWORDS": [],
-        "ALLOWED_USER_IDS": [],
-    }
-}
+print(f"✅ Токен загружен: {token[:20]}...")
+bot = Bot(token)
+labeler = BotLabeler()
 
-CHECK_INTERVAL = 1
-REPLY_COOLDOWN = 1800
-MESSAGE_MAX_AGE = 10
+DB_PATH = "admins.db"
 
-# ГЛОБАЛЬНЫЕ ПЕРЕМЕННЫЕ
-bots_running = {}
-logs = {}
-logs_lock = threading.Lock()
-auto_reply_status = {}
-vk_sessions = {}
-vk_api_objects = {}
-last_command_times = {}
+async def extract_user_id(text: str) -> int:
+    """Извлечь ID пользователя из разных форматов"""
+    if not text:
+        return None
 
-# ========== ЛОГИ ==========
-def log_message(user_key, message_dict):
-    with logs_lock:
-        if user_key not in logs:
-            logs[user_key] = []
-        logs[user_key].append(message_dict)
-        os.makedirs("logs", exist_ok=True)
-        filename = f"logs/{user_key}_logs.json"
-        with open(filename, "w", encoding="utf-8") as f:
-            json.dump(logs[user_key], f, ensure_ascii=False, indent=2)
+    # Прямой ID
+    if text.isdigit():
+        return int(text)
 
-def log_info(user_key, text):
-    print(f"[{user_key}] {text}")
+    # Упоминание [id123|text] или @id123
+    mention_match = re.search(r'\[id(\d+)\|.*?\]', text)
+    if mention_match:
+        return int(mention_match.group(1))
 
-# Эта функция теперь отправляет логи через отдельный цикл событий, чтобы не блокировать VK ботов
-def telegram_send_log_blocking(text):
-    asyncio.run(telegram_send_log(text))
+    at_match = re.search(r'@id(\d+)', text)
+    if at_match:
+        return int(at_match.group(1))
 
-async def telegram_send_log(text):
-    try:
-        bot_tg = Bot(token=TG_BOT_TOKEN)
-        await bot_tg.send_message(chat_id=ADMIN_CHAT_ID, text=text, parse_mode=ParseMode.HTML)
-    except Exception as e:
-        print(f"Ошибка отправки лога в Telegram: {e}")
+    # Ссылка VK
+    vk_link_match = re.search(r'vk\.com/id(\d+)', text)
+    if vk_link_match:
+        return int(vk_link_match.group(1))
 
-
-# ====== VK BOT ======
-def run_vk_bot(user_key, config):
-    TOKEN = config["TOKEN"]
-    ALLOWED_CONFS = config["ALLOWED_CONFS"]
-    AUTO_REPLY_CONF = config["AUTO_REPLY_CONF"]
-    TRIGGER_KEYWORDS = config["TRIGGER_KEYWORDS"]
-    ALLOWED_USER_IDS = config["ALLOWED_USER_IDS"]
-
-    replied_messages = set()
-    last_reply_times = {}
-
-    if user_key not in last_command_times:
-      last_command_times[user_key] = {}
-
-    try:
-        vk_session = vk_api.VkApi(token=TOKEN)
-        vk_api_obj = vk_session.get_api()
-        vk_sessions[user_key] = vk_session
-        vk_api_objects[user_key] = vk_api_obj
-
-        user_info = vk_api_obj.users.get()[0]
-        log_info(user_key, f"Запущен бот для {user_info['first_name']} {user_info['last_name']} (id={user_info['id']})")
-    except Exception as e:
-        log_info(user_key, f"Ошибка подключения к VK: {e}")
-        bots_running[user_key] = False
-        return
-
-    bots_running[user_key] = True
-    
-    while bots_running.get(user_key, False):
+    # Короткая ссылка vk.com/username
+    username_match = re.search(r'vk\.com/([a-zA-Z0-9_.]+)', text)
+    if username_match:
+        username = username_match.group(1)
         try:
-            convs = vk_api_objects[user_key].messages.getConversations(filter='unread', count=50)
-            if convs["count"] > 0:
-                log_info(user_key, f"Непрочитанных диалогов: {convs['count']}")
-
-                for conv in convs["items"]:
-                    peer_id = conv["conversation"]["peer"]["id"]
-                    unread_count = conv["conversation"].get("unread_count", 0)
-                    last_msg = conv.get("last_message", {})
-                    msg_id = last_msg.get("id")
-                    from_id = last_msg.get("from_id")
-                    text = last_msg.get("text", "")
-                    date_msg = last_msg.get("date", 0)
-
-                    log_dict = {
-                        "peer_id": peer_id,
-                        "msg_id": msg_id,
-                        "from_id": from_id,
-                        "text": text,
-                        "date": date_msg,
-                        "unread_count": unread_count,
-                    }
-                    log_message(user_key, log_dict)
-
-                    if peer_id in ALLOWED_CONFS and unread_count > 0:
-                        vk_api_objects[user_key].messages.markAsRead(peer_id=peer_id)
-                        log_info(user_key, f"Отметил {peer_id} как прочитанный")
-
-                    if auto_reply_status.get(user_key, config["AUTO_REPLY_ENABLED"]) and AUTO_REPLY_CONF == peer_id:
-                        current_time = time.time()
-                        if text:
-                            txt_low = text.lower()
-                            for keyword in TRIGGER_KEYWORDS:
-                                match = re.search(fr"^{re.escape(keyword)}\s+([\s\S]+?)\s+(\d+)\s+([\s\S]+)", txt_low)
-                                if match and from_id in ALLOWED_USER_IDS:
-                                    last_reply = last_command_times[user_key].get(from_id, 0)
-                                    if current_time - last_reply >= REPLY_COOLDOWN:
-                                        try:
-                                            vk_api_objects[user_key].messages.send(peer_id=peer_id, message="Выдам", random_id=0)
-                                            last_command_times[user_key][from_id] = current_time
-
-                                            telegram_send_log_blocking(
-                                                f"<b>✅ Автоответ сработал!</b>\n"
-                                                f"<b>Пользователь:</b> [id{from_id}|ссылка]\n"
-                                                f"<b>Команда:</b> {keyword}\n"
-                                                f"<b>Сообщение:</b> {text}"
-                                            )
-                                            log_info(user_key, f"Автоответ отправлен пользователю {from_id} в {peer_id}")
-                                        except Exception as e:
-                                            log_info(user_key, f"Ошибка отправки автоответа: {e}")
-                                    else:
-                                        remain = int(REPLY_COOLDOWN - (current_time - last_reply))
-                                        log_info(user_key, f"Кулдаун автоответа для {from_id}, осталось {remain} сек")
-                                        telegram_send_log_blocking(
-                                            f"<b>⚠️ Кулдаун автоответа</b>\n"
-                                            f"<b>Пользователь:</b> [id{from_id}|ссылка]\n"
-                                            f"<b>Осталось:</b> {remain} сек\n"
-                                            f"<b>Команда:</b> {keyword}"
-                                        )
-                                    break
-                                elif keyword in txt_low:
-                                    telegram_send_log_blocking(
-                                        f"<b>❌ Некорректная форма команды</b>\n"
-                                        f"<b>Пользователь:</b> [id{from_id}|ссылка]\n"
-                                        f"<b>Сообщение:</b> {text}"
-                                    )
-                                    log_info(user_key, f"Некорректная форма команды от {from_id} в {peer_id}")
-            time.sleep(CHECK_INTERVAL)
-
-        except Exception as e:
-            log_info(user_key, f"Ошибка в цикле: {e}")
-            time.sleep(5)
-
-
-# ======== TELEGRAM BOT =======
-async def check_admin(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user_id = update.effective_user.id
-    if str(user_id) != str(ADMIN_CHAT_ID):
-        await update.message.reply_text("🚫 У вас нет доступа к управлению ботом.")
-        return False
-    return True
-
-# ======== КОМАНДЫ ========
-async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not await check_admin(update, context): return
-    text = (
-        "Привет! Управление VK ботами.\n"
-        "Доступные команды:\n"
-        "/status - Статус всех ботов\n"
-        "/users - Список VK пользователей\n"
-        "/dialogs USER - Список диалогов пользователя\n"
-        "/read USER PEER [PAGE] - Просмотр сообщений диалога (страница по 20 сообщений)\n"
-        "/send USER PEER TEXT - Отправить сообщение в диалог\n"
-        "/lastmsgs USER PEER [COUNT] - Последние N сообщений\n"
-        "/autorespond USER ON/OFF - Вкл/выкл автоответ\n"
-        "/stop USER - Остановить VK бота\n"
-        "/startbot USER - Запустить VK бота\n"
-        "/userinfo USER - Инфо о VK пользователе\n"
-        "/download USER PEER - Выгрузить историю диалога в JSON\n"
-        "/allowedusers USER - Список разрешённых VK ID\n"
-        "/allowedconfs USER - Список разрешённых бесед\n"
-        "/addalloweduser USER VKID - Добавить разрешённого пользователя\n"
-        "/removealloweduser USER VKID - Убрать разрешённого пользователя\n"
-        "/addallowedconf USER PEER - Добавить разрешённый чат\n"
-        "/removeallowedconf USER PEER - Убрать разрешённый чат\n"
-    )
-    await update.message.reply_text(text)
-
-async def cmd_status(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not await check_admin(update, context): return
-    msg = ""
-    for user_key in USERS_CONFIG.keys():
-        running = bots_running.get(user_key, False)
-        autoreply = auto_reply_status.get(user_key, USERS_CONFIG[user_key]["AUTO_REPLY_ENABLED"])
-        msg += f"{user_key}: Запущен: {running}, Автоответ: {autoreply}\n"
-    await update.message.reply_text(msg)
-
-async def cmd_users(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not await check_admin(update, context): return
-    lines = []
-    for user_key, cfg in USERS_CONFIG.items():
-        vk_obj = vk_api_objects.get(user_key)
-        if vk_obj:
-            try:
-                user_info = vk_obj.users.get()[0]
-                name = f"{user_info.get('first_name')} {user_info.get('last_name')}"
-            except:
-                name = "Ошибка получения имени"
-        else:
-            name = "Бот не запущен"
-        lines.append(f"{user_key} — {name}")
-    await update.message.reply_text("\n".join(lines))
-
-async def cmd_dialogs(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not await check_admin(update, context): return
-    args = context.args
-    if len(args) != 1:
-        await update.message.reply_text("Использование: /dialogs USER")
-        return
-    user_key = args[0].upper()
-    if user_key not in USERS_CONFIG:
-        await update.message.reply_text("Пользователь не найден.")
-        return
-
-    vk_obj = vk_api_objects.get(user_key)
-    if not vk_obj:
-        await update.message.reply_text("Бот не запущен.")
-        return
-
-    try:
-        convs = vk_obj.messages.getConversations(count=50)
-        if convs["count"] == 0:
-            await update.message.reply_text("Нет бесед.")
-            return
-
-        lines = []
-        for conv in convs["items"]:
-            peer_id = conv["conversation"]["peer"]["id"]
-            title = conv["conversation"].get("chat_settings", {}).get("title")
-            if not title:
-                if peer_id > 2000000000:
-                    title = f"Беседа {peer_id}"
-                else:
-                    try:
-                        u = vk_obj.users.get(user_ids=peer_id)[0]
-                        title = f"{u.get('first_name')} {u.get('last_name')} (id:{peer_id})"
-                    except:
-                        title = f"Пользователь {peer_id}"
-            lines.append(f"{peer_id} — {title}")
-        await update.message.reply_text("\n".join(lines))
-
-    except Exception as e:
-        await update.message.reply_text(f"Ошибка: {e}")
-
-async def cmd_read(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not await check_admin(update, context):
-        return
-    args = context.args
-    if len(args) < 2:
-        await update.message.reply_text("Использование: /read USER PEER [PAGE]")
-        return
-
-    user_key = args[0].upper()
-    peer_id = args[1]
-    page = int(args[2]) if len(args) > 2 else 1
-
-    if user_key not in USERS_CONFIG:
-        await update.message.reply_text("Пользователь не найден.")
-        return
-    try:
-        peer_id = int(peer_id)
-    except:
-        await update.message.reply_text("peer_id должен быть числом.")
-        return
-    if page < 1:
-        page = 1
-
-    vk_obj = vk_api_objects.get(user_key)
-    if not vk_obj:
-        await update.message.reply_text("Бот не запущен.")
-        return
-
-    count = 20
-    offset = (page - 1) * count
-    try:
-        msgs = vk_obj.messages.getHistory(peer_id=peer_id, count=count, offset=offset)
-        items = msgs.get("items", [])
-        if not items:
-            await update.message.reply_text("Сообщений нет.")
-            return
-
-        user_ids = list({m.get("from_id") for m in items if m.get("from_id") > 0})
-
-        users_info = {}
-        if user_ids:
-            response = vk_obj.users.get(user_ids=','.join(map(str, user_ids)))
-            for u in response:
-                users_info[u['id']] = f"{u['first_name']} {u['last_name']}"
-
-        text_lines = []
-        for m in items:
-            dt = m.get("date")
-            dt_str = datetime.fromtimestamp(dt).strftime('%Y-%m-%d %H:%M:%S')
-            from_id = m.get("from_id")
-            text = m.get("text", "")
-            out = m.get("out")
-            direction = "->" if out == 1 else "<-"
-            name = users_info.get(from_id, "Unknown")
-
-            text_lines.append(f"[{dt_str}] {from_id} ({name}) {direction}: {text}")
-
-        reply_text = f"Сообщения страницы {page} (peer_id={peer_id}):\n" + "\n".join(text_lines)
-        await update.message.reply_text(reply_text)
-    except Exception as e:
-        await update.message.reply_text(f"Ошибка получения истории: {e}")
-
-async def cmd_send(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not await check_admin(update, context):
-        return
-    args = context.args
-    if len(args) < 3:
-        await update.message.reply_text("Использование: /send USER PEER TEXT")
-        return
-
-    user_key = args[0].upper()
-    try:
-        peer_id = int(args[1])
-    except:
-        await update.message.reply_text("PEER должен быть числом.")
-        return
-
-    text = " ".join(args[2:])
-    if user_key not in USERS_CONFIG:
-        await update.message.reply_text("Пользователь не найден.")
-        return
-
-    vk_obj = vk_api_objects.get(user_key)
-    if not vk_obj:
-        await update.message.reply_text("Бот не запущен.")
-        return
-
-    try:
-        vk_obj.messages.send(peer_id=peer_id, message=text, random_id=0)
-        await update.message.reply_text(f"Сообщение отправлено в {peer_id} от {user_key}.")
-    except Exception as e:
-        await update.message.reply_text(f"Ошибка отправки сообщения: {e}")
-
-async def cmd_lastmsgs(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not await check_admin(update, context): return
-    args = context.args
-    if len(args) < 2:
-        await update.message.reply_text("Использование: /lastmsgs USER PEER [COUNT]")
-        return
-    user_key = args[0].upper()
-    peer_id = args[1]
-    count = int(args[2]) if len(args) > 2 else 20
-
-    if user_key not in USERS_CONFIG:
-        await update.message.reply_text("Пользователь не найден.")
-        return
-    try:
-        peer_id = int(peer_id)
-    except:
-        await update.message.reply_text("peer_id должен быть числом.")
-        return
-    if count < 1 or count > 100:
-        count = 20
-
-    vk_obj = vk_api_objects.get(user_key)
-    if not vk_obj:
-        await update.message.reply_text("Бот не запущен.")
-        return
-
-    try:
-        msgs = vk_obj.messages.getHistory(peer_id=peer_id, count=count)
-        items = msgs.get("items", [])
-        if not items:
-            await update.message.reply_text("Сообщений нет.")
-            return
-
-        text_lines = []
-        for m in reversed(items):
-            from_id = m.get("from_id")
-            out = m.get("out")
-            text = m.get("text", "")
-            direction = "->" if out == 1 else "<-"
-            text_lines.append(f"[{from_id} {direction}] {text}")
-
-        reply_text = f"Последние {len(text_lines)} сообщений (peer_id={peer_id}):\n" + "\n".join(text_lines)
-        await update.message.reply_text(reply_text)
-    except Exception as e:
-        await update.message.reply_text(f"Ошибка: {e}")
-
-async def cmd_autorespond(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not await check_admin(update, context): return
-    args = context.args
-    if len(args) != 2:
-        await update.message.reply_text("Использование: /autorespond USER ON|OFF")
-        return
-    user_key = args[0].upper()
-    action = args[1].lower()
-
-    if user_key not in USERS_CONFIG:
-        await update.message.reply_text("Пользователь не найден.")
-        return
-    if action not in ("on", "off"):
-        await update.message.reply_text("Используйте ON или OFF")
-        return
-
-    auto_reply_status[user_key] = (action == "on")
-    await update.message.reply_text(f"Автоответ для {user_key} {'включен' if action == 'on' else 'выключен'}.")
-
-async def cmd_stop(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not await check_admin(update, context): return
-    args = context.args
-    if len(args) != 1:
-        await update.message.reply_text("Использование: /stop USER")
-        return
-    user_key = args[0].upper()
-    if user_key not in USERS_CONFIG:
-        await update.message.reply_text("Пользователь не найден.")
-        return
-    bots_running[user_key] = False
-    await update.message.reply_text(f"Остановка бота {user_key} запрошена.")
-
-async def cmd_startbot(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not await check_admin(update, context): return
-    args = context.args
-    if len(args) != 1:
-        await update.message.reply_text("Использование: /startbot USER")
-        return
-    user_key = args[0].upper()
-    if user_key not in USERS_CONFIG:
-        await update.message.reply_text("Пользователь не найден.")
-        return
-    if bots_running.get(user_key):
-        await update.message.reply_text(f"Бот {user_key} уже запущен.")
-        return
-
-    t = threading.Thread(target=run_vk_bot, args=(user_key, USERS_CONFIG[user_key]), daemon=True)
-    t.start()
-    await update.message.reply_text(f"Бот {user_key} запущен.")
-
-async def cmd_userinfo(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not await check_admin(update, context): return
-    args = context.args
-    if len(args) != 1:
-        await update.message.reply_text("Использование: /userinfo USERID")
-        return
-    try:
-        vk_id = int(args[0])
-    except:
-        await update.message.reply_text("Неверный VK ID.")
-        return
-
-    for user_key, vk_obj in vk_api_objects.items():
-        try:
-            info = vk_obj.users.get(user_ids=vk_id)[0]
-            name = f"{info.get('first_name')} {info.get('last_name')}"
-            await update.message.reply_text(f"Пользователь VK {vk_id}:\n{name}")
-            return
+            result = await bot.api.utils.resolve_screen_name(screen_name=username)
+            if result and result.type == 'user':
+                return result.object_id
         except:
-            continue
-    await update.message.reply_text("Пользователь не найден или ошибка VK API.")
+            pass
 
-async def cmd_download(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not await check_admin(update, context): return
-    args = context.args
-    if len(args) != 2:
-        await update.message.reply_text("Использование: /download USER PEER")
-        return
-    user_key = args[0].upper()
+    return None
+
+def get_admin_level(user_id: int) -> int:
+    with sqlite3.connect(DB_PATH) as conn:
+        cursor = conn.cursor()
+        cursor.execute("SELECT level FROM admins WHERE id_vk = ?", (user_id,))
+        result = cursor.fetchone()
+        return result[0] if result else 0
+
+def check_command_access(user_id: int, command_name: str) -> bool:
+    """Проверить доступ пользователя к команде"""
+    user_level = get_admin_level(user_id)
+
+    with sqlite3.connect(DB_PATH) as conn:
+        cursor = conn.cursor()
+        cursor.execute("""
+            SELECT required_level, is_disabled 
+            FROM command_restrictions 
+            WHERE command_name = ?
+        """, (command_name,))
+        result = cursor.fetchone()
+
+        if not result:
+            # Если команды нет в таблице, используем базовую логику
+            return True
+
+        required_level, is_disabled = result
+
+        # Если команда отключена
+        if is_disabled:
+            return False
+
+        # Проверяем уровень доступа
+        return user_level >= required_level
+
+async def get_user_data(user_id: int, auto_track_join=True):
+    """Получить или создать запись пользователя"""
+    with sqlite3.connect(DB_PATH) as conn:
+        cursor = conn.cursor()
+        cursor.execute("SELECT * FROM admins WHERE id_vk = ?", (user_id,))
+        result = cursor.fetchone()
+
+        if not result:
+            # Проверяем реально ли пользователь в чате через API
+            is_really_in_chat = 0
+            if current_chat_peer_id:
+                try:
+                    chat_members = await bot.api.messages.get_conversation_members(peer_id=current_chat_peer_id)
+                    member_ids = [member.member_id for member in chat_members.items if member.member_id > 0]
+                    is_really_in_chat = 1 if user_id in member_ids else 0
+                except:
+                    # Если не можем проверить через API, считаем что в чате если пишет
+                    is_really_in_chat = 1 if auto_track_join else 0
+
+            # Создаем запись для нового пользователя
+            try:
+                user_info = await bot.api.users.get(user_ids=[user_id])
+                name = f"{user_info[0].first_name} {user_info[0].last_name}"
+            except:
+                name = "Неизвестно"
+
+            current_time = get_moscow_time().strftime("%Y-%m-%d %H:%M:%S")
+
+            if is_really_in_chat:
+                cursor.execute("""
+                    INSERT INTO admins (id_vk, name, level, server, domains, position, 
+                                      invited_at, first_invited_at, msg_count, is_in_chat,
+                                      total_time_seconds, session_start)
+                    VALUES (?, ?, 0, 1, '', '', ?, ?, 1, 1, 0, ?)
+                """, (user_id, name, current_time, current_time, current_time))
+            else:
+                cursor.execute("""
+                    INSERT INTO admins (id_vk, name, level, server, domains, position, 
+                                      invited_at, first_invited_at, msg_count, is_in_chat,
+                                      total_time_seconds, session_start)
+                    VALUES (?, ?, 0, 1, '', '', '', '', 0, 0, 0, '')
+                """, (user_id, name))
+
+            conn.commit()
+
+            # Возвращаем созданную запись
+            cursor.execute("SELECT * FROM admins WHERE id_vk = ?", (user_id,))
+            return cursor.fetchone()
+        else:
+            # Если пользователь пишет и он не в чате (is_in_chat = 0), значит он вернулся
+            if auto_track_join and len(result) > 9 and result[9] == 0:
+                current_time = get_moscow_time().strftime("%Y-%m-%d %H:%M:%S")
+                cursor.execute("""
+                    UPDATE admins SET invited_at = ?, is_in_chat = 1, session_start = ?
+                    WHERE id_vk = ?
+                """, (current_time, current_time, user_id))
+
+                # Если это первое приглашение вообще, устанавливаем first_invited_at
+                if not result[7] or result[7] == '':
+                    cursor.execute("""
+                        UPDATE admins SET first_invited_at = ? WHERE id_vk = ?
+                    """, (current_time, user_id))
+
+                conn.commit()
+
+                # Получаем обновлённые данные
+                cursor.execute("SELECT * FROM admins WHERE id_vk = ?", (user_id,))
+                result = cursor.fetchone()
+
+            # Если пользователь уже в чате, но у него нет времени начала сессии - устанавливаем
+            elif auto_track_join and len(result) > 11 and (not result[11] or result[11] == ''):
+                current_time = get_moscow_time().strftime("%Y-%m-%d %H:%M:%S")
+                cursor.execute("""
+                    UPDATE admins SET session_start = ? WHERE id_vk = ?
+                """, (current_time, user_id))
+                conn.commit()
+
+                # Получаем обновлённые данные
+                cursor.execute("SELECT * FROM admins WHERE id_vk = ?", (user_id,))
+                result = cursor.fetchone()
+
+        return result
+
+def update_message_count(user_id: int):
+    """Увеличить счётчик сообщений пользователя"""
+    with sqlite3.connect(DB_PATH) as conn:
+        cursor = conn.cursor()
+        cursor.execute("""
+            UPDATE admins SET msg_count = msg_count + 1 
+            WHERE id_vk = ?
+        """, (user_id,))
+        conn.commit()
+
+async def send_greeting_to_user(user_id: int):
+    """Отправить приветствие новому пользователю"""
     try:
-        peer_id = int(args[1])
-    except:
-        await update.message.reply_text("peer_id должен быть числом.")
-        return
-    filename = f"logs/{user_key}_logs.json"
-    if not os.path.exists(filename):
-        await update.message.reply_text("Логи не найдены.")
-        return
-    with open(filename, "r", encoding="utf-8") as f:
-        data = json.load(f)
-    filtered = [m for m in data if m.get("peer_id") == peer_id]
-    if not filtered:
-        await update.message.reply_text("Сообщений для этого диалога нет.")
-        return
-    out_filename = f"logs/{user_key}_{peer_id}_history.json"
-    with open(out_filename, "w", encoding="utf-8") as f:
-        json.dump(filtered, f, ensure_ascii=False, indent=2)
-    with open(out_filename, "rb") as f:
-        await update.message.reply_document(f, filename=f"{user_key}_{peer_id}_history.json")
+        with sqlite3.connect(DB_PATH) as conn:
+            cursor = conn.cursor()
 
-async def cmd_allowedusers(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not await check_admin(update, context): return
-    args = context.args
-    if len(args) != 1:
-        await update.message.reply_text("Использование: /allowedusers USER")
-        return
-    user_key = args[0].upper()
-    if user_key not in USERS_CONFIG:
-        await update.message.reply_text("Пользователь не найден.")
-        return
-    allowed = USERS_CONFIG[user_key]["ALLOWED_USER_IDS"]
-    if not allowed:
-        await update.message.reply_text("Список пуст.")
-        return
-    await update.message.reply_text("\n".join(str(u) for u in allowed))
+            # Получаем активное приветствие
+            cursor.execute("SELECT value FROM greeting_settings WHERE key = 'active_greeting_id'")
+            active_greeting = cursor.fetchone()
 
-async def cmd_allowedconfs(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not await check_admin(update, context): return
-    args = context.args
-    if len(args) != 1:
-        await update.message.reply_text("Использование: /allowedconfs USER")
-        return
-    user_key = args[0].upper()
-    if user_key not in USERS_CONFIG:
-        await update.message.reply_text("Пользователь не найден.")
-        return
-    allowed = USERS_CONFIG[user_key]["ALLOWED_CONFS"]
-    if not allowed:
-        await update.message.reply_text("Список пуст.")
-        return
-    await update.message.reply_text("\n".join(str(c) for c in allowed))
+            if not active_greeting or not active_greeting[0]:
+                return  # Нет активного приветствия
 
-async def cmd_addalloweduser(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not await check_admin(update, context): return
-    args = context.args
-    if len(args) != 2:
-        await update.message.reply_text("Использование: /addalloweduser USER VKID")
-        return
-    user_key = args[0].upper()
+            greeting_id = int(active_greeting[0])
+
+            # Получаем текст приветствия и время ожидания
+            cursor.execute("SELECT text, wait_seconds FROM greetings WHERE id = ?", (greeting_id,))
+            greeting_data = cursor.fetchone()
+
+            if not greeting_data:
+                return  # Приветствие не найдено
+
+            text, wait_seconds = greeting_data
+
+            # Получаем информацию о пользователе
+            user_info = await bot.api.users.get(user_ids=[user_id])
+            user_name = f"{user_info[0].first_name} {user_info[0].last_name}"
+
+            # Заменяем переменные в тексте
+            formatted_text = text.replace("{name}", user_name).replace("{id}", str(user_id))
+
+            # Отправляем приветствие с задержкой если нужно
+            import asyncio
+            if wait_seconds > 0:
+                await asyncio.sleep(wait_seconds)
+
+            # Формируем сообщение как от бота с тегом пользователя
+            greeting_message = f"ABot » Приветствие пользователя [id{user_id}|{user_name}]:\n\n{formatted_text}"
+
+            await bot.api.messages.send(
+                peer_id=TARGET_PEER_ID,
+                message=greeting_message,
+                random_id=0
+            )
+
+            print(f"✅ Приветствие отправлено пользователю {user_id}")
+
+    except Exception as e:
+        print(f"❌ Ошибка отправки приветствия пользователю {user_id}: {e}")
+
+async def handle_user_join(user_id: int, invited_by: int = None):
+    """Обработать присоединение пользователя к беседе"""
+    current_time = get_moscow_time().strftime("%Y-%m-%d %H:%M:%S")
+
+    with sqlite3.connect(DB_PATH) as conn:
+        cursor = conn.cursor()
+
+        # Проверяем, не заблокирован ли пользователь
+        cursor.execute("SELECT banned_at, reason, banned_by FROM blacklisted_users WHERE user_id = ?", (user_id,))
+        blocked = cursor.fetchone()
+        if blocked:
+            print(f"🚫 Заблокированный пользователь {user_id} попытался присоединиться к беседе")
+
+            try:
+                # Получаем информацию о пользователе
+                user_info = await bot.api.users.get(user_ids=[user_id])
+                name = f"{user_info[0].first_name} {user_info[0].last_name}"
+
+                # Получаем информацию о том, кто заблокировал
+                banned_by_info = await bot.api.users.get(user_ids=[blocked[2]])
+                banned_by_name = f"{banned_by_info[0].first_name} {banned_by_info[0].last_name}"
+
+                # Автоматически исключаем заблокированного пользователя
+                await bot.api.messages.remove_chat_user(
+                    chat_id=TARGET_CHAT_ID,
+                    member_id=user_id
+                )
+
+                # Отправляем уведомление в беседу
+                await bot.api.messages.send(
+                    peer_id=TARGET_PEER_ID,
+                    message=f"🚫 Заблокированный пользователь https://vk.com/id{user_id} ({name}) был автоматически исключён из беседы!\n\n"
+                           f"📅 Дата блокировки: {blocked[0]}\n"
+                           f"📝 Причина блокировки: {blocked[1]}\n"
+                           f"👮 Заблокировал: https://vk.com/id{blocked[2]} ({banned_by_name})\n\n"
+                           f"ℹ️ Для разблокировки используйте: /unblock {user_id} <причина>",
+                    random_id=0
+                )
+
+                print(f"✅ Заблокированный пользователь {user_id} автоматически исключён")
+                return
+
+            except Exception as e:
+                print(f"❌ Ошибка при исключении заблокированного пользователя {user_id}: {e}")
+                return
+
+        # СИСТЕМА КОНТРОЛЯ ПРИГЛАШЕНИЙ
+        if invited_by and invited_by != user_id:
+            inviter_level = get_admin_level(invited_by)
+
+            # Проверяем уровень приглашающего
+            if inviter_level < 4:
+                try:
+                    # Получаем информацию о приглашённом и приглашающем
+                    invited_info = await bot.api.users.get(user_ids=[user_id])
+                    invited_name = f"{invited_info[0].first_name} {invited_info[0].last_name}"
+
+                    inviter_info = await bot.api.users.get(user_ids=[invited_by])
+                    inviter_name = f"{inviter_info[0].first_name} {inviter_info[0].last_name}"
+
+                    # Исключаем приглашённого пользователя
+                    await bot.api.messages.remove_chat_user(
+                        chat_id=TARGET_CHAT_ID,
+                        member_id=user_id
+                    )
+
+                    # Исключаем того, кто пригласил (если он ещё в беседе)
+                    try:
+                        await bot.api.messages.remove_chat_user(
+                            chat_id=TARGET_CHAT_ID,
+                            member_id=invited_by
+                        )
+                        handle_user_leave(invited_by)  # Обновляем статус в БД
+                    except:
+                        pass  # Возможно, приглашающий уже не в беседе
+
+                    # Отправляем уведомление в беседу
+                    await bot.api.messages.send(
+                        peer_id=TARGET_PEER_ID,
+                        message=f"🚫 НАРУШЕНИЕ ПРАВИЛ ПРИГЛАШЕНИЯ!\n\n"
+                               f"❌ [https://vk.com/id{invited_by}|{inviter_name}] (уровень {inviter_level}) попытался пригласить пользователя\n"
+                               f"👤 Приглашённый: [https://vk.com/id{user_id}|{invited_name}]\n\n"
+                               f"⚠️ АВТОМАТИЧЕСКИЕ ДЕЙСТВИЯ:\n"
+                               f"🔴 Приглашённый пользователь исключён\n"
+                               f"🔴 Нарушитель исключён из беседы\n\n"
+                               f"📋 ПРАВИЛА:\n"
+                               f"• Приглашать в беседу могут только администраторы уровня 4 и выше\n"
+                               f"• Текущий уровень нарушителя: {inviter_level} (недостаточно)\n"
+                               f"• Минимальный требуемый уровень: 4",
+                        random_id=0
+                    )
+
+                    print(f"🚫 Нарушение правил: пользователь {invited_by} (уровень {inviter_level}) пригласил {user_id}")
+                    print(f"✅ Оба пользователя исключены из беседы")
+                    return
+
+                except Exception as e:
+                    print(f"❌ Ошибка при обработке нарушения приглашения: {e}")
+                    return
+        cursor.execute("SELECT * FROM admins WHERE id_vk = ?", (user_id,))
+        result = cursor.fetchone()
+
+        if result:
+            # Пользователь уже есть в БД - обновляем время входа
+            cursor.execute("""
+                UPDATE admins SET invited_at = ?, is_in_chat = 1, session_start = ?
+                WHERE id_vk = ?
+            """, (current_time, current_time, user_id))
+
+            # Если это первое присоединение, устанавливаем first_invited_at
+            if not result[7] or result[7] == '':
+                cursor.execute("""
+                    UPDATE admins SET first_invited_at = ? WHERE id_vk = ?
+                """, (current_time, user_id))
+        else:
+            # Новый пользователь - создаём запись
+            try:
+                # Получаем имя через API (асинхронно это сложно, поэтому упрощаем)
+                name = f"Пользователь {user_id}"
+            except:
+                name = "Неизвестно"
+
+            cursor.execute("""
+                INSERT INTO admins (id_vk, name, level, server, domains, position, 
+                                  invited_at, first_invited_at, msg_count, is_in_chat,
+                                  total_time_seconds, session_start)
+                VALUES (?, ?, 0, 1, '', '', ?, ?, 0, 1, 0, ?)
+            """, (user_id, name, current_time, current_time, current_time))
+
+        conn.commit()
+
+    # Отправляем приветствие новому пользователю
+    await send_greeting_to_user(user_id)
+
+def handle_user_leave(user_id: int):
+    """Обработать исключение пользователя из беседы"""
+    current_time = get_moscow_time()
+
+    with sqlite3.connect(DB_PATH) as conn:
+        cursor = conn.cursor()
+
+        # Получаем данные пользователя
+        cursor.execute("SELECT session_start, total_time_seconds FROM admins WHERE id_vk = ?", (user_id,))
+        result = cursor.fetchone()
+
+        if result and result[0]:
+            try:
+                session_start = datetime.strptime(result[0], "%Y-%m-%d %H:%M:%S")
+                session_start = session_start.replace(tzinfo=MSK_TZ)
+                session_duration = (current_time - session_start).total_seconds()
+
+                new_total_time = (result[1] or 0) + session_duration
+
+                # Обновляем запись - пользователь покинул беседу
+                cursor.execute("""
+                    UPDATE admins SET is_in_chat = 0, total_time_seconds = ?, 
+                                    invited_at = '', session_start = ''
+                    WHERE id_vk = ?
+                """, (new_total_time, user_id))
+            except:
+                # Если ошибка с временем, просто помечаем как покинувшего
+                cursor.execute("""
+                    UPDATE admins SET is_in_chat = 0, invited_at = '', session_start = ''
+                    WHERE id_vk = ?
+                """, (user_id,))
+
+        conn.commit()
+
+def calculate_time_in_chat(user_data):
+    """Вычислить время нахождения в беседе"""
+    current_time = get_moscow_time()
+
+    # Проверяем находится ли пользователь в чате
+    is_in_chat = user_data[9] if len(user_data) > 9 else 1
+
+    # Время с последнего приглашения
+    if is_in_chat == 1 and len(user_data) > 6 and user_data[6]:
+        try:
+            invited_at = datetime.strptime(user_data[6], "%Y-%m-%d %H:%M:%S")
+            invited_at = invited_at.replace(tzinfo=MSK_TZ)
+            delta_recent = current_time - invited_at
+            days_recent = delta_recent.days
+            hours_recent, remainder_recent = divmod(delta_recent.seconds, 3600)
+            minutes_recent = remainder_recent // 60
+            time_since_invite = f"{days_recent} дней {hours_recent} час {minutes_recent} минут"
+        except:
+            time_since_invite = "неизвестно"
+    else:
+        time_since_invite = "нет информации"
+
+    # Общее время за всё время
+    total_seconds = user_data[10] if len(user_data) > 10 else 0
+
+    # Если пользователь сейчас в чате, добавляем время текущей сессии
+    if is_in_chat == 1 and len(user_data) > 11 and user_data[11]:
+        try:
+            session_start = datetime.strptime(user_data[11], "%Y-%m-%d %H:%M:%S")
+            session_start = session_start.replace(tzinfo=MSK_TZ)
+            current_session = (current_time - session_start).total_seconds()
+
+            # Используем максимальное значение между сохраненным временем и временем с приглашения
+            if is_in_chat == 1 and len(user_data) > 6 and user_data[6]:
+                try:
+                    invited_at = datetime.strptime(user_data[6], "%Y-%m-%d %H:%M:%S")
+                    invited_at = invited_at.replace(tzinfo=MSK_TZ)
+                    time_since_invite_seconds = (current_time - invited_at).total_seconds()
+                    total_seconds = max(total_seconds + current_session, time_since_invite_seconds)
+                except:
+                    total_seconds += current_session
+            else:
+                total_seconds += current_session
+        except:
+            # Если не можем вычислить сессию, используем время с приглашения
+            if is_in_chat == 1 and len(user_data) > 6 and user_data[6]:
+                try:
+                    invited_at = datetime.strptime(user_data[6], "%Y-%m-%d %H:%M:%S")
+                    invited_at = invited_at.replace(tzinfo=MSK_TZ)
+                    time_since_invite_seconds = (current_time - invited_at).total_seconds()
+                    total_seconds = max(total_seconds, time_since_invite_seconds)
+                except:
+                    pass
+
+    # Форматируем общее время
+    if total_seconds > 0:
+        total_days = int(total_seconds // 86400)
+        total_hours = int((total_seconds % 86400) // 3600)
+        total_minutes = int((total_seconds % 3600) // 60)
+        time_total = f"{total_days} дней {total_hours} час {total_minutes} минут"
+    else:
+        time_total = "неизвестно"
+
+    return time_since_invite, time_total
+
+def init_db():
+    with sqlite3.connect(DB_PATH) as conn:
+        cursor = conn.cursor()
+        cursor.execute("""
+            CREATE TABLE IF NOT EXISTS admins (
+                id_vk INTEGER PRIMARY KEY,
+                name TEXT NOT NULL,
+                level INTEGER NOT NULL,
+                server INTEGER DEFAULT 1,
+                domains TEXT DEFAULT '',
+                position TEXT DEFAULT '',
+                invited_at TEXT DEFAULT '',
+                first_invited_at TEXT DEFAULT '',
+                msg_count INTEGER DEFAULT 0,
+                is_in_chat INTEGER DEFAULT 1,
+                total_time_seconds REAL DEFAULT 0,
+                session_start TEXT DEFAULT ''
+            )
+        """)
+
+        # Добавляем новые столбцы если их нет
+        try:
+            cursor.execute("ALTER TABLE admins ADD COLUMN first_invited_at TEXT DEFAULT ''")
+        except sqlite3.OperationalError:
+            pass
+
+        try:
+            cursor.execute("ALTER TABLE admins ADD COLUMN is_in_chat INTEGER DEFAULT 1")
+        except sqlite3.OperationalError:
+            pass
+
+        try:
+            cursor.execute("ALTER TABLE admins ADD COLUMN total_time_seconds REAL DEFAULT 0")
+        except sqlite3.OperationalError:
+            pass
+
+        try:
+            cursor.execute("ALTER TABLE admins ADD COLUMN session_start TEXT DEFAULT ''")
+        except sqlite3.OperationalError:
+            pass
+
+        # Создаём таблицу настройки, если она не существует
+        cursor.execute("""
+            CREATE TABLE IF NOT EXISTS bot_settings (
+                key TEXT PRIMARY KEY,
+                value TEXT
+            )
+        """)
+
+        # Создаём таблицу истории изменения доменов
+        cursor.execute("""
+            CREATE TABLE IF NOT EXISTS domain_history (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                user_id INTEGER NOT NULL,
+                old_domain TEXT DEFAULT '',
+                new_domain TEXT DEFAULT '',
+                changed_by INTEGER NOT NULL,
+                changed_at TEXT NOT NULL,
+                FOREIGN KEY (user_id) REFERENCES admins (id_vk),
+                FOREIGN KEY (changed_by) REFERENCES admins (id_vk)
+            )
+        """)
+
+        # Создаём таблицу предупреждений
+        cursor.execute("""
+            CREATE TABLE IF NOT EXISTS warnings (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                user_id INTEGER NOT NULL,
+                warns_count INTEGER DEFAULT 0,
+                kicks_count INTEGER DEFAULT 0,
+                FOREIGN KEY (user_id) REFERENCES admins (id_vk)
+            )
+        """)
+
+        # Создаём таблицу истории предупреждений
+        cursor.execute("""
+            CREATE TABLE IF NOT EXISTS warning_history (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                user_id INTEGER NOT NULL,
+                action_type TEXT NOT NULL,
+                warns_change INTEGER NOT NULL,
+                kicks_change INTEGER DEFAULT 0,
+                reason TEXT DEFAULT '',
+                issued_by INTEGER NOT NULL,
+                issued_at TEXT NOT NULL,
+                FOREIGN KEY (user_id) REFERENCES admins (id_vk),
+                FOREIGN KEY (issued_by) REFERENCES admins (id_vk)
+            )
+        """)
+
+        # Создаём таблицу заблокированных пользователей
+        cursor.execute("""
+            CREATE TABLE IF NOT EXISTS blacklisted_users (
+                user_id INTEGER PRIMARY KEY,
+                banned_at TEXT NOT NULL,
+                banned_by INTEGER NOT NULL,
+                reason TEXT DEFAULT ''
+            )
+        """)
+
+        # Создаём таблицу заглушенных пользователей
+        cursor.execute("""
+            CREATE TABLE IF NOT EXISTS muted_users (
+                user_id INTEGER PRIMARY KEY,
+                muted_at TEXT NOT NULL,
+                muted_by INTEGER NOT NULL,
+                muted_until TEXT DEFAULT '',
+                reason TEXT DEFAULT ''
+            )
+        """)
+
+        # Создаём таблицу ограничений доступа к командам
+        cursor.execute("""
+            CREATE TABLE IF NOT EXISTS command_restrictions (
+                command_name TEXT PRIMARY KEY,
+                required_level INTEGER NOT NULL,
+                is_disabled INTEGER DEFAULT 0,
+                modified_by INTEGER,
+                modified_at TEXT
+            )
+        """)
+
+        # Создаём таблицу приветствий
+        cursor.execute("""
+            CREATE TABLE IF NOT EXISTS greetings (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                text TEXT NOT NULL,
+                wait_seconds INTEGER DEFAULT 0,
+                created_by INTEGER NOT NULL,
+                created_at TEXT NOT NULL,
+                modified_by INTEGER,
+                modified_at TEXT
+            )
+        """)
+
+        # Создаём таблицу настроек приветствий
+        cursor.execute("""
+            CREATE TABLE IF NOT EXISTS greeting_settings (
+                key TEXT PRIMARY KEY,
+                value TEXT
+            )
+        """)
+
+        # Добавляем базовые ограничения команд, если их нет
+        commands_with_levels = [
+            ('kick', 4), ('warn', 4), ('unwarn', 4), ('warns', 4), ('warnlist', 4),
+            ('mute', 4), ('unmute', 4), ('muted', 4), ('blocked', 4),
+            ('addadmin', 5), ('deladmin', 5), ('setposition', 5), ('getall', 5), ('unblock', 5),
+            ('dn', 3), ('admins', 3), ('top', 3),
+            ('get', 1), ('help', 1), ('mywarns', 0), ('b_date', 0), ('n_history', 2), ('accommand', 6),
+            ('greetings', 6), ('ban', 6)
+        ]
+
+        for cmd, level in commands_with_levels:
+            cursor.execute("""
+                INSERT OR IGNORE INTO command_restrictions (command_name, required_level)
+                VALUES (?, ?)
+            """, (cmd, level))
+
+        conn.commit()
+
+async def one_time_reset_chat_users():
+    """Одноразовый сброс времени только для пользователей в беседе"""
     try:
-        vkid = int(args[1])
-    except:
-        await update.message.reply_text("VKID должен быть числом.")
-        return
-    if user_key not in USERS_CONFIG:
-        await update.message.reply_text("Пользователь не найден.")
-        return
-    if vkid in USERS_CONFIG[user_key]["ALLOWED_USER_IDS"]:
-        await update.message.reply_text("Уже в списке.")
-        return
-    USERS_CONFIG[user_key]["ALLOWED_USER_IDS"].append(vkid)
-    await update.message.reply_text(f"Добавлен {vkid} в разрешённые пользователи {user_key}.")
+        with sqlite3.connect(DB_PATH) as conn:
+            cursor = conn.cursor()
 
-async def cmd_removealloweduser(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not await check_admin(update, context): return
-    args = context.args
-    if len(args) != 2:
-        await update.message.reply_text("Использование: /removealloweduser USER VKID")
-        return
-    user_key = args[0].upper()
+            # Проверяем флаг сброса
+            cursor.execute("SELECT value FROM bot_settings WHERE key = 'chat_time_reset_done'")
+            result = cursor.fetchone()
+            if result and result[0] == '1':
+                print("🔄 Сброс времени для участников беседы уже был выполнен")
+                return
+
+            current_time = get_moscow_time().strftime("%Y-%m-%d %H:%M:%S")
+
+            # Получаем только пользователей, которые находятся в беседе (is_in_chat = 1)
+            cursor.execute("SELECT id_vk FROM admins WHERE is_in_chat = 1")
+            chat_users = cursor.fetchall()
+
+            updated_count = 0
+            for (user_id,) in chat_users:
+                cursor.execute("""
+                    UPDATE admins SET 
+                        invited_at = ?,
+                        first_invited_at = CASE 
+                            WHEN first_invited_at IS NULL OR first_invited_at = '' THEN ?
+                            ELSE first_invited_at
+                        END,
+                        session_start = ?,
+                        total_time_seconds = 0
+                    WHERE id_vk = ? AND is_in_chat = 1
+                """, (current_time, current_time, current_time, user_id))
+                updated_count += 1
+
+            # Устанавливаем флаг что сброс выполнен (используем новый ключ)
+            cursor.execute("""
+                INSERT OR REPLACE INTO bot_settings (key, value) VALUES ('chat_time_reset_done', '1')
+            """)
+
+            conn.commit()
+            print(f"🔄 Одноразовый сброс времени выполнен для {updated_count} участников беседы")
+
+    except Exception as e:
+        print(f"⚠️ Ошибка сброса времени для участников беседы: {e}")
+
+# Целевая беседа для работы бота (замените на нужный ID)
+TARGET_CHAT_ID = 2  # ID беседы (peer_id будет 2000000001)
+TARGET_PEER_ID = 2000000000 + TARGET_CHAT_ID
+
+# Глобальная переменная для хранения peer_id беседы
+current_chat_peer_id = None
+
+# Словарь для хранения последних запросов пользователей (для кнопок навигации)
+user_last_n_history = {}
+
+# Множество для отслеживания пользователей, получивших уведомление о муте
+mute_notifications_sent = set()
+
+async def sync_chat_members():
+    """Синхронизировать участников беседы с БД через VK API"""
+    global current_chat_peer_id
+
     try:
-        vkid = int(args[1])
-    except:
-        await update.message.reply_text("VKID должен быть числом.")
-        return
-    if user_key not in USERS_CONFIG:
-        await update.message.reply_text("Пользователь не найден.")
-        return
-    if vkid not in USERS_CONFIG[user_key]["ALLOWED_USER_IDS"]:
-        await update.message.reply_text("В списке нет такого пользователя.")
-        return
-    USERS_CONFIG[user_key]["ALLOWED_USER_IDS"].remove(vkid)
-    await update.message.reply_text(f"Удалён {vkid} из разрешённых пользователей {user_key}.")
+        if not current_chat_peer_id:
+            print("⚠️ Ещё не получено ни одного сообщения из беседы для определения ID")
+            print("🔄 Синхронизация будет выполнена после первого сообщения")
+            return
 
-async def cmd_addallowedconf(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not await check_admin(update, context): return
-    args = context.args
-    if len(args) != 2:
-        await update.message.reply_text("Использование: /addallowedconf USER PEER")
+        try:
+            chat_members = await bot.api.messages.get_conversation_members(peer_id=current_chat_peer_id)
+            current_time = get_moscow_time().strftime("%Y-%m-%d %H:%M:%S")
+
+            with sqlite3.connect(DB_PATH) as conn:
+                cursor = conn.cursor()
+
+                # Получаем всех пользователей из БД
+                cursor.execute("SELECT id_vk FROM admins")
+                db_users = set([row[0] for row in cursor.fetchall()])
+
+                # Получаем активных участников беседы
+                active_members = set()
+                for member in chat_members.items:
+                    if member.member_id > 0:  # Исключаем боты
+                        active_members.add(member.member_id)
+
+                # Обновляем статус пользователей
+                for user_id in db_users:
+                    if user_id in active_members:
+                        # Пользователь в чате - обновляем статус
+                        cursor.execute("""
+                            UPDATE admins SET is_in_chat = 1 WHERE id_vk = ?
+                        """, (user_id,))
+                    else:
+                        # Пользователя нет в чате - помечаем как покинувшего
+                        cursor.execute("""
+                            UPDATE admins SET is_in_chat = 0 WHERE id_vk = ?
+                        """, (user_id,))
+
+                conn.commit()
+                chat_id = current_chat_peer_id - 2000000000
+                print(f"✅ Синхронизация для беседы ID {chat_id}: найдено {len(active_members)} участников")
+
+        except Exception as api_error:
+            print(f"⚠️ Не удалось получить список участников через API: {api_error}")
+            print("🔄 Будет использоваться отслеживание по сообщениям")
+
+    except Exception as e:
+        print(f"⚠️ Ошибка синхронизации: {e}")
+
+async def auto_track_member_changes(message: Message):
+    """Отслеживать изменения участников через системные сообщения VK"""
+    if hasattr(message, 'action') and message.action is not None:
+        current_time = get_moscow_time().strftime("%Y-%m-%d %H:%M:%S")
+
+        if message.action.type == 'chat_invite_user':
+            # Пользователь приглашён
+            invited_user_id = message.action.member_id
+            inviter_id = message.from_id  # Кто пригласил
+            await handle_user_join(invited_user_id, inviter_id)
+            print(f"👤 Пользователь {invited_user_id} приглашён в беседу пользователем {inviter_id}")
+
+        elif message.action.type == 'chat_kick_user':
+            # Пользователь исключён
+            kicked_user_id = message.action.member_id
+            handle_user_leave(kicked_user_id)
+            print(f"👤 Пользователь {kicked_user_id} исключён из беседы")
+
+@labeler.message(text="/kick <user_arg> <reason>")
+async def kick_user_with_reason(message: Message, user_arg: str, reason: str):
+    # Проверка на целевую беседу
+    if message.peer_id != TARGET_PEER_ID:
         return
-    user_key = args[0].upper()
+    if not check_command_access(message.from_id, 'kick'):
+        return await message.answer("⛔ У вас нет доступа к этой команде.")
+
+    user_level = get_admin_level(message.from_id)
+
+    id_vk = await extract_user_id(user_arg)
+    if not id_vk:
+        return await message.answer(
+            "❌ Не удалось определить ID пользователя.\n\n"
+            "📝 Список доступных команд:\n"
+            "/kick <Пользователь>\n"
+            "/kick <Пользователь> <Причина>\n\n"
+            "💡 Используйте: ID, @упоминание или ссылку VK"
+        )
+
+    target_level = get_admin_level(id_vk)
+    if target_level >= user_level:
+        return await message.answer("⛔ Вы не можете исключить пользователя с уровнем равным или выше вашего.")
+
     try:
-        peer_id = int(args[1])
-    except:
-        await update.message.reply_text("peer_id должен быть числом.")
-        return
-    if user_key not in USERS_CONFIG:
-        await update.message.reply_text("Пользователь не найден.")
-        return
-    if peer_id in USERS_CONFIG[user_key]["ALLOWED_CONFS"]:
-        await update.message.reply_text("Уже в списке.")
-        return
-    USERS_CONFIG[user_key]["ALLOWED_CONFS"].append(peer_id)
-    await update.message.reply_text(f"Добавлен {peer_id} в разрешённые беседы {user_key}.")
+        await bot.api.messages.remove_chat_user(
+            chat_id=message.peer_id - 2000000000,
+            member_id=id_vk
+        )
 
-async def cmd_removeallowedconf(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not await check_admin(update, context): return
-    args = context.args
-    if len(args) != 2:
-        await update.message.reply_text("Использование: /removeallowedconf USER PEER")
+        # Обновляем статус в БД
+        handle_user_leave(id_vk)
+
+        try:
+            user_info = await bot.api.users.get(user_ids=[id_vk])
+            name = f"{user_info[0].first_name} {user_info[0].last_name}"
+        except:
+            name = "Неизвестно"
+
+        await message.answer(f"✅ [https://vk.com/id{id_vk}|{name}] исключён из беседы.\n📝 Причина: {reason}")
+    except Exception as e:
+        await message.answer(f"❌ Ошибка при исключении: {str(e)}")
+
+@labeler.message(text="/kick <user_arg>")
+async def kick_user_no_reason(message: Message, user_arg: str):
+    # Проверка на целевую беседу
+    if message.peer_id != TARGET_PEER_ID:
         return
-    user_key = args[0].upper()
+    if not check_command_access(message.from_id, 'kick'):
+        return await message.answer("⛔ У вас нет доступа к этой команде.")
+
+    user_level = get_admin_level(message.from_id)
+
+    id_vk = await extract_user_id(user_arg)
+    if not id_vk:
+        return await message.answer(
+            "❌ Не удалось определить ID пользователя.\n\n"
+            "📝 Список доступных команд:\n"
+            "/kick <Пользователь>\n"
+            "/kick <Пользователь> <Причина>\n\n"
+            "💡 Используйте: ID, @упоминание или ссылку VK"
+        )
+
+    target_level = get_admin_level(id_vk)
+    if target_level >= user_level:
+        return await message.answer("⛔ Вы не можете исключить пользователя с уровнем равным или выше вашего.")
+
     try:
-        peer_id = int(args[1])
+        await bot.api.messages.remove_chat_user(
+            chat_id=message.peer_id - 2000000000,
+            member_id=id_vk
+        )
+
+        # Обновляем статус в БД
+        handle_user_leave(id_vk)
+
+        try:
+            user_info = await bot.api.users.get(user_ids=[id_vk])
+            name = f"{user_info[0].first_name} {user_info[0].last_name}"
+        except:
+            name = "Неизвестно"
+
+        await message.answer(f"✅ [https://vk.com/id{id_vk}|{name}] исключён из беседы.\n📝 Причина: не указана")
+    except Exception as e:
+        await message.answer(f"❌ Ошибка при исключении: {str(e)}")
+
+@labeler.message(text="/kick")
+async def kick_help(message: Message):
+    # Проверка на целевую беседу
+    if message.peer_id != TARGET_PEER_ID:
+        return
+    if not check_command_access(message.from_id, 'kick'):
+        return await message.answer("⛔ У вас нет доступа к этой команде.")
+
+    await message.answer(
+        "📝 Список доступных команд:\n\n"
+        "/kick <Пользователь>\n"
+        "/kick <Пользователь> <Причина>\n\n"
+        "💡 Пример использования:\n"
+        "/kick @id123456789\n"
+        "/kick 123456789 Нарушение правил\n"
+        "/kick https://vk.com/id123456789 Спам"
+    )
+
+@labeler.message(text="/admins <page:int>")
+async def admins_list(message: Message, page: int):
+    if message.peer_id != TARGET_PEER_ID:
+        return
+    if not check_command_access(message.from_id, 'admins'):
+        return await message.answer("⛔ У вас нет доступа к этой команде.")
+
+    with sqlite3.connect(DB_PATH) as conn:
+        cursor = conn.cursor()
+        cursor.execute("SELECT id_vk, name, level FROM admins WHERE level > 0 ORDER BY level DESC")
+        admins = cursor.fetchall()
+
+    per_page = 10
+    total_pages = (len(admins) + per_page - 1) // per_page
+    if page < 1 or page > total_pages:
+        return await message.answer(f"❌ Такой страницы нет. Всего страниц: {total_pages}.")
+
+    start = (page - 1) * per_page
+    admins_slice = admins[start:start + per_page]
+    text = f"ABot » Список администраторов. Страница: {page}/{total_pages}\n\n"
+    for i, (uid, name, level) in enumerate(admins_slice, start=start + 1):
+        text += f"{i}. [https://vk.com/id{uid}|{name}] (ID: {uid}), уровень: {level}\n"
+
+    await message.answer(text)
+
+@labeler.message(text="/admins")
+async def admins_missing_page(message: Message):
+    if message.peer_id != TARGET_PEER_ID:
+        return
+    if not check_command_access(message.from_id, 'admins'):
+        return await message.answer("⛔ У вас нет доступа к этой команде.")
+    else:
+        return await message.answer("❌ Ошибка: укажите номер страницы. Пример: /admins 1")
+
+@labeler.message(text="/addadmin <user_arg> <level:int>")
+async def add_admin(message: Message, user_arg: str, level: int):
+    if message.peer_id != TARGET_PEER_ID:
+        return
+    user_level = get_admin_level(message.from_id)
+    if user_level < 5:
+        return await message.answer("❌ У вас нет прав добавлять админов.")
+
+    id_vk = await extract_user_id(user_arg)
+    if not id_vk:
+        return await message.answer("❌ Не удалось определить ID пользователя. Используйте ID, @упоминание или ссылку VK.")
+
+    if level >= user_level:
+        return await message.answer(f"⛔ Вы не можете добавить админа с уровнем {level} — он должен быть ниже вашего ({user_level}).")
+
+    with sqlite3.connect(DB_PATH) as conn:
+        cursor = conn.cursor()
+
+        # Проверяем, не заблокирован ли пользователь
+        cursor.execute("SELECT banned_at, reason FROM blacklisted_users WHERE user_id = ?", (id_vk,))
+        blocked = cursor.fetchone()
+        if blocked:
+            try:
+                user_info = await bot.api.users.get(user_ids=[id_vk])
+                name = f"{user_info[0].first_name} {user_info[0].last_name}"
+            except:
+                name = "Неизвестно"
+
+            return await message.answer(f"🚫 Невозможно назначить администратора [https://vk.com/id{id_vk}|{name}] - пользователь заблокирован!\n\n"
+                                       f"📅 Дата блокировки: {blocked[0]}\n"
+                                       f"📝 Причина: {blocked[1]}\n\n"
+                                       f"💡 Сначала разблокируйте пользователя: /unblock {id_vk} <причина>")
+
+        cursor.execute("SELECT level FROM admins WHERE id_vk = ?", (id_vk,))
+        existing = cursor.fetchone()
+
+        if existing and existing[0] > 0:
+            return await message.answer("⚠️ Этот пользователь уже админ.")
+
+        try:
+            user = (await bot.api.users.get(user_ids=[id_vk]))[0]
+            name = f"{user.first_name} {user.last_name}"
+        except Exception:
+            name = "Неизвестно"
+
+        current_time = get_moscow_time().strftime("%Y-%m-%d %H:%M:%S")
+
+        if existing:
+            # При обновлении админки НЕ трогаем invited_at - оставляем время реального приглашения в беседу
+            cursor.execute("""
+                UPDATE admins SET level = ?, name = ?
+                WHERE id_vk = ?
+            """, (level, name, id_vk))
+        else:
+            # Для нового пользователя устанавливаем время как время получения админки
+            cursor.execute("""
+                INSERT INTO admins (id_vk, name, level, invited_at, first_invited_at)
+                VALUES (?, ?, ?, ?, ?)
+            """, (id_vk, name, level, current_time, current_time))
+
+        conn.commit()
+
+    await message.answer(f"✅ [https://vk.com/id{id_vk}|{name}] добавлен с уровнем {level}.")
+
+@labeler.message(text="/deladmin <user_arg>")
+async def del_admin(message: Message, user_arg: str):
+    if message.peer_id != TARGET_PEER_ID:
+        return
+    user_level = get_admin_level(message.from_id)
+    if user_level < 5:
+        return await message.answer("❌ У вас нет прав удалять админов.")
+
+    id_vk = await extract_user_id(user_arg)
+    if not id_vk:
+        return await message.answer("❌ Не удалось определить ID пользователя. Используйте ID, @упоминание или ссылку VK.")
+
+    with sqlite3.connect(DB_PATH) as conn:
+        cursor = conn.cursor()
+        cursor.execute("SELECT name, level FROM admins WHERE id_vk = ?", (id_vk,))
+        row = cursor.fetchone()
+        if not row:
+            return await message.answer("⚠️ Админ с таким ID не найден.")
+        target_name, target_level = row
+
+        if target_level >= user_level:
+            return await message.answer("⛔ Вы не можете удалять админов с уровнем равным или выше вашего.")
+
+        cursor.execute("UPDATE admins SET level = 0 WHERE id_vk = ?", (id_vk,))
+        conn.commit()
+
+    await message.answer(f"🗑️ [https://vk.com/id{id_vk}|{target_name}] удалён из списка админов."), 
+
+@labeler.message(text="/get <user_arg>")
+@labeler.message(text="/get")
+async def get_user_info(message: Message, user_arg: str = None):
+    if message.peer_id != TARGET_PEER_ID:
+        return
+
+    requester_level = get_admin_level(message.from_id)
+
+    if user_arg:
+        target_id = await extract_user_id(user_arg)
+        if not target_id:
+            return await message.answer("❌ Не удалось определить ID пользователя. Используйте ID, @упоминание или ссылку VK.")
+    else:
+        target_id = message.from_id
+
+    if target_id != message.from_id and requester_level < 2:
+        return await message.answer("⛔ Вы можете просматривать информацию только о себе.")
+
+    try:
+        user = (await bot.api.users.get(user_ids=[target_id]))[0]
+        full_name = f"{user.first_name} {user.last_name}"
+    except Exception:
+        full_name = "Неизвестно"
+
+    user_data = await get_user_data(target_id, auto_track_join=False)
+
+    if len(user_data) >= 12:
+        (uid, name, level, server, domains, position, 
+         invited_at_str, first_invited_at_str, msg_count, is_in_chat, 
+         total_time_seconds, session_start) = user_data[:12]
+    else:
+        # Старый формат
+        uid, name, level, server = user_data[:4]
+        domains = user_data[4] if len(user_data) > 4 else ''
+        position = user_data[5] if len(user_data) > 5 else ''
+        invited_at_str = user_data[6] if len(user_data) > 6 else ''
+        first_invited_at_str = user_data[7] if len(user_data) > 7 else ''
+        msg_count = user_data[8] if len(user_data) > 8 else 0
+        is_in_chat = 1  # По умолчанию считаем что в чате
+        total_time_seconds = 0
+        session_start = ''
+
+    # Вычисляем время
+    time_since_invite, time_total = calculate_time_in_chat(user_data)
+
+    # Отображение времени приглашения
+    if invited_at_str and invited_at_str != '' and is_in_chat:
+        try:
+            invited_at_dt = datetime.strptime(invited_at_str, "%Y-%m-%d %H:%M:%S")
+            invited_at_display = invited_at_dt.strftime("%d.%m.%Y %H:%M")
+        except:
+            invited_at_display = "неизвестно"
+    else:
+        invited_at_display = "неизвестно"
+
+    chat_name = "RADMIR [МО][Каратели][SERVER 01]"
+    level_text = f"{level}" if level > 0 else "Отсутствует"
+
+    # Показываем все домены через запятую
+    if domains:
+        domains_list = [d.strip() for d in domains.split(',') if d.strip()]
+        domains_text = ', '.join(domains_list) if domains_list else "Отсутствует"
+    else:
+        domains_text = "Отсутствует"
+
+    position_text = position if position else "Отсутствует"
+
+    text = (
+        f"ABot » Информация о [https://vk.com/id{target_id}|{full_name}]\n\n"
+        f"Информация о беседе:\n"
+        f" – \"{chat_name}\"\n"
+        f" – Приглашен в беседу: {invited_at_display}\n\n"
+        f"Информация о сообщениях:\n"
+        f" – Количество сообщений: {msg_count}\n\n"
+        f"Информация о пользователе:\n"
+        f" – Сервер: {server}\n"
+        f" – Домены: {domains_text}\n"
+        f" – Уровень Администратора: {level_text}\n"
+        f" – Должность: {position_text}\n\n"
+        f"Время нахождения в беседе:\n"
+        f" – С приглашения: {time_since_invite}\n"
+        f" – За всё время: {time_total}"
+    )
+
+    await message.answer(text)
+
+
+
+@labeler.message(text="/setposition <user_arg> <position>")
+async def set_position(message: Message, user_arg: str, position: str):
+    if message.peer_id != TARGET_PEER_ID:
+        return
+    user_level = get_admin_level(message.from_id)
+    if user_level < 5:
+        return await message.answer("❌ У вас нет прав управлять должностями.")
+
+    id_vk = await extract_user_id(user_arg)
+    if not id_vk:
+        return await message.answer("❌ Не удалось определить ID пользователя. Используйте ID, @упоминание или ссылку VK.")
+
+    await get_user_data(id_vk, auto_track_join=False)
+
+    with sqlite3.connect(DB_PATH) as conn:
+        cursor = conn.cursor()
+        cursor.execute("UPDATE admins SET position = ? WHERE id_vk = ?", (position, id_vk))
+        cursor.execute("SELECT name FROM admins WHERE id_vk = ?", (id_vk,))
+        result = cursor.fetchone()
+        name = result[0] if result else "Неизвестно"
+        conn.commit()
+
+    await message.answer(f"✅ Должность для [https://vk.com/id{id_vk}|{name}] установлена: {position}")
+
+@labeler.message(text="/help <level:int>")
+async def help_level(message: Message, level: int):
+    if message.peer_id != TARGET_PEER_ID:
+        return
+    user_level = get_admin_level(message.from_id)
+    if user_level == 0:
+        return await message.answer("⛔ У вас нет доступа к этой команде.")
+
+    if level < 0 or level > 6:
+        return await message.answer("❌ Уровень должен быть от 0 до 6.")
+
+    if level > user_level:
+        return await message.answer(f"⛔ Вы не можете просматривать команды уровня {level}, доступ ограничен.")
+
+    # Получаем актуальные уровни доступа к командам из БД
+    with sqlite3.connect(DB_PATH) as conn:
+        cursor = conn.cursor()
+        cursor.execute("SELECT command_name, required_level, is_disabled FROM command_restrictions")
+        command_restrictions = {row[0]: (row[1], row[2]) for row in cursor.fetchall()}
+
+    def get_commands_for_level(target_level):
+        commands = []
+        for cmd_name, (required_level, is_disabled) in command_restrictions.items():
+            if required_level == target_level and not is_disabled:
+                commands.append(f"• /{cmd_name}")
+        return commands
+
+    commands_for_level = get_commands_for_level(level)
+
+    if commands_for_level:
+        commands_text = '\n'.join(commands_for_level)
+        text = f"ABot » Команды администратора (уровень {level}):\n{commands_text}"
+        if level < 6:
+            text += "\n• Все команды предыдущих уровней"
+    else:
+        text = f"ABot » Команды администратора (уровень {level}):\n• Нет специальных команд для этого уровня"
+        if level > 0:
+            text += "\n• Все команды предыдущих уровней"
+
+    await message.answer(text)
+
+@labeler.message(text="/help")
+async def help_usage(message: Message):
+    if message.peer_id != TARGET_PEER_ID:
+        return
+    if not check_command_access(message.from_id, 'help'):
+        return
+
+    user_level = get_admin_level(message.from_id)
+
+    # Получаем информацию о пользователе
+    try:
+        user_info = await bot.api.users.get(user_ids=[message.from_id])
+        user_name = f"{user_info[0].first_name} {user_info[0].last_name}"
     except:
-        await update.message.reply_text("peer_id должен быть числом.")
+        user_name = "Неизвестно"
+
+    if user_level == 0:
+        return await message.answer(f"⛔ [https://vk.com/id{message.from_id}|{user_name}], у вас нет доступа к этой команде.\n\n🔹 Ваш текущий уровень администратора: {user_level} (Участник)")
+
+    # Получаем актуальные уровни доступа к командам из БД
+    with sqlite3.connect(DB_PATH) as conn:
+        cursor = conn.cursor()
+        cursor.execute("SELECT command_name, required_level, is_disabled FROM command_restrictions")
+        command_restrictions = {row[0]: (row[1], row[2]) for row in cursor.fetchall()}
+
+    # Создаем список всех команд с их описаниями и требуемыми уровнями
+    command_descriptions = {
+        'accommand': 'Управление доступом к командам',
+        'greetings': 'Управление приветствиями', 
+        'ban': 'Заблокировать пользователя',
+        'addadmin': 'Назначить администратора',
+        'deladmin': 'Снять администратора',
+        'setposition': 'Управление должностями',
+        'getall': 'Информация о всех пользователях',
+        'unblock': 'Разблокировать пользователя',
+        'kick': 'Исключить пользователя',
+        'warn': 'Выдать предупреждение',
+        'unwarn': 'Снять предупреждение',
+        'warns': 'Список пользователей с предупреждениями',
+        'warnlist': 'История предупреждений пользователя',
+        'mute': 'Заглушить пользователя',
+        'unmute': 'Снять заглушку',
+        'muted': 'Список заглушенных пользователей',
+        'blocked': 'Список заблокированных пользователей',
+        'dn': 'Управление доменами пользователей',
+        'admins': 'Список администраторов',
+        'top': 'Топ пользователей по сообщениям',
+        'get': 'Информация о пользователе',
+        'n_history': 'История изменения доменов',
+        'help': 'Справка по командам',
+        'mywarns': 'Ваши предупреждения',
+        'b_date': 'ТОП 5 пользователей с ближайшим днём рождения'
+    }
+
+    # Собираем доступные команды и сортируем по убыванию уровня
+    available_commands = []
+
+    for cmd_name, description in command_descriptions.items():
+        if cmd_name in command_restrictions:
+            required_level, is_disabled = command_restrictions[cmd_name]
+            if not is_disabled and user_level >= required_level:
+                available_commands.append((required_level, cmd_name, description))
+
+    # Сортируем по убыванию уровня (сначала самые высокие)
+    available_commands.sort(reverse=True)
+
+    # Формируем список команд
+    commands_list = []
+    for required_level, cmd_name, description in available_commands:
+        level_suffix = f" ({required_level}+ уровень)" if required_level > 0 else ""
+        commands_list.append(f"• /{cmd_name} - {description}{level_suffix}")
+
+    # Формируем ответ
+    commands_text = '\n'.join(commands_list) if commands_list else "Нет доступных команд"
+
+    text = (
+        f"ABot » Справка по командам для [https://vk.com/id{message.from_id}|{user_name}]\n\n"
+        f"🔹 Ваш текущий уровень администратора: {user_level}\n\n"
+        f"📋 Доступные команды:\n\n"
+        f"{commands_text}\n\n"
+        f"💡 Подсказки:\n"
+        f"• /help <1-6> - команды конкретного уровня\n"
+        f"• Для выдачи предупреждения: 2 пред. = 1 выговор"
+    )
+
+    await message.answer(text)
+
+@labeler.message(text="/n_history <user_arg> <page:int>")
+async def domain_history_with_page(message: Message, user_arg: str, page: int):
+    if message.peer_id != TARGET_PEER_ID:
         return
-    if user_key not in USERS_CONFIG:
-        await update.message.reply_text("Пользователь не найден.")
+    if not check_command_access(message.from_id, 'n_history'):
+        return await message.answer("⛔ У вас нет доступа к этой команде.")
+
+    id_vk = await extract_user_id(user_arg)
+    if not id_vk:
+        return await message.answer("❌ Не удалось определить ID пользователя. Используйте ID, @упоминание или ссылку VK.")
+
+    # Сохраняем последний запрос для кнопок навигации
+    user_last_n_history[message.from_id] = {'target_id': id_vk, 'page': page}
+
+    try:
+        user_info = await bot.api.users.get(user_ids=[id_vk])
+        full_name = f"{user_info[0].first_name} {user_info[0].last_name}"
+    except:
+        full_name = "Неизвестно"
+
+    with sqlite3.connect(DB_PATH) as conn:
+        cursor = conn.cursor()
+        cursor.execute("""
+            SELECT old_domain, new_domain, changed_by, changed_at 
+            FROM domain_history 
+            WHERE user_id = ? 
+            ORDER BY id DESC
+        """, (id_vk,))
+        history = cursor.fetchall()
+
+    if not history:
+        return await message.answer("📝 История изменения доменов для [https://vk.com/id{id_vk}|{full_name}] пуста.")
+
+    per_page = 10
+    total_pages = (len(history) + per_page - 1) // per_page
+
+    if page < 1 or page > total_pages:
+        return await message.answer(f"❌ Страница {page} не найдена. Доступно страниц: {total_pages}")
+
+    start = (page - 1) * per_page
+    history_slice = history[start:start + per_page]
+
+    text = f"ABot » История изменения доменов пользователя {full_name} (страница {page}/{total_pages}):\n\n"
+
+    for old_domain, new_domain, changed_by, changed_at in history_slice:
+        old_text = f"'{old_domain}'" if old_domain else "''"
+        new_text = f"'{new_domain}'" if new_domain else "''"
+
+        try:
+            changer_info = await bot.api.users.get(user_ids=[changed_by])
+            changer_name = f"{changer_info[0].first_name} {changer_info[0].last_name}"
+        except:
+            changer_name = "Неизвестно"
+
+        text += f"[{changed_at}] Изменение имени: {old_text} → {new_text} (изменил [https://vk.com/id{changed_by}|{changer_name}])\n"
+
+    await message.answer(text)
+
+@labeler.message(text="/n_history <user_arg>")
+async def domain_history_no_page(message: Message, user_arg: str):
+    if message.peer_id != TARGET_PEER_ID:
         return
-    if peer_id not in USERS_CONFIG[user_key]["ALLOWED_CONFS"]:
-        await update.message.reply_text("В списке нет такого чата.")
+    if not check_command_access(message.from_id, 'n_history'):
+        return await message.answer("⛔ У вас нет доступа к этой команде.")
+
+    id_vk = await extract_user_id(user_arg)
+    if not id_vk:
+        return await message.answer("❌ Не удалось определить ID пользователя. Используйте ID, @упоминание или ссылку VK.")
+
+    # Сохраняем последний запрос для кнопок навигации
+    user_last_n_history[message.from_id] = {'target_id': id_vk, 'page': 1}
+
+    try:
+        user_info = await bot.api.users.get(user_ids=[id_vk])
+        full_name = f"{user_info[0].first_name} {user_info[0].last_name}"
+    except:
+        full_name = "Неизвестно"
+
+    with sqlite3.connect(DB_PATH) as conn:
+        cursor = conn.cursor()
+        cursor.execute("""
+            SELECT old_domain, new_domain, changed_by, changed_at 
+            FROM domain_history 
+            WHERE user_id = ? 
+            ORDER BY id DESC
+        """, (id_vk,))
+        history = cursor.fetchall()
+
+    if not history:
+        return await message.answer("📝 История изменения доменов для [https://vk.com/id{id_vk}|{full_name}] пуста.")
+
+    per_page = 10
+    total_pages = (len(history) + per_page - 1) // per_page
+
+    history_slice = history[:per_page]
+
+    text = f"ABot » История изменения доменов пользователя {full_name} (страница 1/{total_pages}):\n\n"
+
+    for old_domain, new_domain, changed_by, changed_at in history_slice:
+        old_text = f"'{old_domain}'" if old_domain else "''"
+        new_text = f"'{new_domain}'" if new_domain else "''"
+
+        try:
+            changer_info = await bot.api.users.get(user_ids=[changed_by])
+            changer_name = f"{changer_info[0].first_name} {changer_info[0].last_name}"
+        except:
+            changer_name = "Неизвестно"
+
+        text += f"[{changed_at}] Изменение имени: {old_text} → {new_text} (изменил [https://vk.com/id{changed_by}|{changer_name}])\n"
+
+    await message.answer(text)
+
+@labeler.message(text="/n_history")
+async def n_history_help(message: Message):
+    if message.peer_id != TARGET_PEER_ID:
         return
-    USERS_CONFIG[user_key]["ALLOWED_CONFS"].remove(peer_id)
-    await update.message.reply_text(f"Удалён {peer_id} из разрешённых бесед {user_key}.")
+    if not check_command_access(message.from_id, 'n_history'):
+        return await message.answer("⛔ У вас нет доступа к этой команде.")
+
+    await message.answer(
+        "📝 Использование команды /n_history:\n\n"
+        "/n_history <Пользователь>\n"
+        "/n_history <Пользователь> <Страница>\n\n"
+        "💡 Пример использования:\n"
+        "/n_history @id123456789\n"
+        "/n_history 123456789 2\n"
+        "/n_history https://vk.com/id123456789"
+    )
+
+@labeler.message(text="/addadmin <user_arg>")
+async def addadmin_help(message: Message, user_arg: str):
+    if message.peer_id != TARGET_PEER_ID:
+        return
+    if not check_command_access(message.from_id, 'addadmin'):
+        return await message.answer("⛔ У вас нет доступа к этой команде.")
+
+    await message.answer(
+        "📝 Использование команды /addadmin:\n\n"
+        "/addadmin <Пользователь> <Уровень>\n\n"
+        "💡 Пример использования:\n"
+        "/addadmin @id123456789 3\n"
+        "/addadmin 123456789 4\n"
+        "/addadmin https://vk.com/id123456789 2"
+    )
+
+@labeler.message(text="/addadmin")
+async def addadmin_missing_help(message: Message):
+    if message.peer_id != TARGET_PEER_ID:
+        return
+    if not check_command_access(message.from_id, 'addadmin'):
+        return await message.answer("⛔ У вас нет доступа к этой команде.")
+
+    await message.answer(
+        "📝 Использование команды /addadmin:\n\n"
+        "/addadmin <Пользователь> <Уровень>\n\n"
+        "💡 Пример использования:\n"
+        "/addadmin @id123456789 3\n"
+        "/addadmin 123456789 4\n"
+        "/addadmin https://vk.com/id123456789 2"
+    )
+
+@labeler.message(text="/deladmin")
+async def deladmin_help(message: Message):
+    if message.peer_id != TARGET_PEER_ID:
+        return
+    if not check_command_access(message.from_id, 'deladmin'):
+        return await message.answer("⛔ У вас нет доступа к этой команде.")
+
+    await message.answer(
+        "📝 Использование команды /deladmin:\n\n"
+        "/deladmin <Пользователь>\n\n"
+        "💡 Пример использования:\n"
+        "/deladmin @id123456789\n"
+        "/deladmin 123456789\n"
+        "/deladmin https://vk.com/id123456789"
+    )
 
 
-# ============ ЗАПУСК ===============
-def main():
-    # Запускаем VK ботов в отдельных потоках, так как они блокирующие
-    for user_key, config in USERS_CONFIG.items():
-        thread = threading.Thread(target=run_vk_bot, args=(user_key, config), daemon=True)
-        thread.start()
 
-    # Запускаем Telegram-бота в основном потоке с помощью Application.run_polling
-    application = Application.builder().token(TG_BOT_TOKEN).build()
-    application.add_handler(CommandHandler("start", cmd_start))
-    application.add_handler(CommandHandler("status", cmd_status))
-    application.add_handler(CommandHandler("users", cmd_users))
-    application.add_handler(CommandHandler("dialogs", cmd_dialogs))
-    application.add_handler(CommandHandler("read", cmd_read))
-    application.add_handler(CommandHandler("send", cmd_send))
-    application.add_handler(CommandHandler("lastmsgs", cmd_lastmsgs))
-    application.add_handler(CommandHandler("autorespond", cmd_autorespond))
-    application.add_handler(CommandHandler("stop", cmd_stop))
-    application.add_handler(CommandHandler("startbot", cmd_startbot))
-    application.add_handler(CommandHandler("userinfo", cmd_userinfo))
-    application.add_handler(CommandHandler("download", cmd_download))
-    application.add_handler(CommandHandler("allowedusers", cmd_allowedusers))
-    application.add_handler(CommandHandler("allowedconfs", cmd_allowedconfs))
-    application.add_handler(CommandHandler("addalloweduser", cmd_addalloweduser))
-    application.add_handler(CommandHandler("removealloweduser", cmd_removealloweduser))
-    application.add_handler(CommandHandler("addallowedconf", cmd_addallowedconf))
-    application.add_handler(CommandHandler("removeallowedconf", cmd_removeallowedconf))
+@labeler.message(text="/setposition <user_arg>")
+async def setposition_help(message: Message, user_arg: str):
+    if message.peer_id != TARGET_PEER_ID:
+        return
+    if not check_command_access(message.from_id, 'setposition'):
+        return await message.answer("⛔ У вас нет доступа к этой команде.")
 
-    application.run_polling(allowed_updates=Update.ALL_TYPES)
+    await message.answer(
+        "📝 Использование команды /setposition:\n\n"
+        "/setposition <Пользователь> <Должность>\n\n"
+        "💡 Пример использования:\n"
+        "/setposition @id123456789 Администратор\n"
+        "/setposition 123456789 Модератор\n"
+        "/setposition https://vk.com/id123456789 Старший админ"
+    )
+
+@labeler.message(text="/setposition")
+async def setposition_missing_help(message: Message):
+    if message.peer_id != TARGET_PEER_ID:
+        return
+    if not check_command_access(message.from_id, 'setposition'):
+        return await message.answer("⛔ У вас нет доступа к этой команде.")
+
+    await message.answer(
+        "📝 Использование команды /setposition:\n\n"
+        "/setposition <Пользователь> <Должность>\n\n"
+        "💡 Пример использования:\n"
+        "/setposition @id123456789 Администратор\n"
+        "/setposition 123456789 Модератор\n"
+        "/setposition https://vk.com/id123456789 Старший админ"
+    )
+
+@labeler.message(text="/dn consist_list")
+async def dn_consist_list(message: Message):
+    if message.peer_id != TARGET_PEER_ID:
+        return
+    if not check_command_access(message.from_id, 'dn'):
+        return await message.answer("⛔ У вас нет доступа к этой команде.")
+
+    with sqlite3.connect(DB_PATH) as conn:
+        cursor = conn.cursor()
+        cursor.execute("SELECT id_vk, name, domains FROM admins WHERE domains != '' ORDER BY name")
+        users_with_domains = cursor.fetchall()
+
+    if not users_with_domains:
+        return await message.answer("📝 Список доменов в конференции пуст.")
+
+    text = "ABot » Список доменов в конференции:\n\n"
+    for uid, name, domains in users_with_domains:
+        domains_list = [d.strip() for d in domains.split(',') if d.strip()]
+        domains_text = ', '.join(domains_list)
+        text += f"[https://vk.com/id{uid}|{name}]: {domains_text}\n"
+
+    await message.answer(text)
+
+@labeler.message(text="/dn add <user_arg> <domain>")
+async def dn_add(message: Message, user_arg: str, domain: str):
+    if message.peer_id != TARGET_PEER_ID:
+        return
+    user_level = get_admin_level(message.from_id)
+    if user_level < 3:
+        return await message.answer("❌ У вас нет прав управлять доменами.")
+
+    id_vk = await extract_user_id(user_arg)
+    if not id_vk:
+        return await message.answer("❌ Не удалось определить ID пользователя. Используйте ID, @упоминание или ссылку VK.")
+
+    await get_user_data(id_vk, auto_track_join=False)
+
+    with sqlite3.connect(DB_PATH) as conn:
+        cursor = conn.cursor()
+
+        # Получаем старые домены и имя
+        cursor.execute("SELECT domains, name FROM admins WHERE id_vk = ?", (id_vk,))
+        result = cursor.fetchone()
+        old_domains = result[0] if result and result[0] else ''
+        name = result[1] if result else "Неизвестно"
+
+        # Добавляем новый домен к существующим
+        if old_domains:
+            domains_list = [d.strip() for d in old_domains.split(',') if d.strip()]
+            if domain not in domains_list:
+                domains_list.append(domain)
+                new_domains = ', '.join(domains_list)
+            else:
+                return await message.answer(f"⚠️ Домен '{domain}' уже добавлен для [https://vk.com/id{id_vk}|{name}]")
+        else:
+            new_domains = domain
+
+        # Обновляем домены
+        cursor.execute("UPDATE admins SET domains = ? WHERE id_vk = ?", (new_domains, id_vk))
+
+        # Записываем в историю
+        current_time = get_moscow_time().strftime("%d.%m.%Y %H:%M:%S")
+        cursor.execute("""
+            INSERT INTO domain_history (user_id, old_domain, new_domain, changed_by, changed_at)
+            VALUES (?, ?, ?, ?, ?)
+        """, (id_vk, old_domains, new_domains, message.from_id, current_time))
+
+        conn.commit()
+
+    await message.answer(f"✅ Домен '{domain}' добавлен для [https://vk.com/id{id_vk}|{name}]")
+
+@labeler.message(text="/dn set <user_arg> <domain>")
+async def dn_set(message: Message, user_arg: str, domain: str):
+    if message.peer_id != TARGET_PEER_ID:
+        return
+    user_level = get_admin_level(message.from_id)
+    if user_level < 3:
+        return await message.answer("❌ У вас нет прав управлять доменами.")
+
+    id_vk = await extract_user_id(user_arg)
+    if not id_vk:
+        return await message.answer("❌ Не удалось определить ID пользователя. Используйте ID, @упоминание или ссылку VK.")
+
+    await get_user_data(id_vk, auto_track_join=False)
+
+    with sqlite3.connect(DB_PATH) as conn:
+        cursor = conn.cursor()
+
+        # Получаем старые домены
+        cursor.execute("SELECT domains, name FROM admins WHERE id_vk = ?", (id_vk,))
+        result = cursor.fetchone()
+        old_domains = result[0] if result and result[0] else ''
+        name = result[1] if result else "Неизвестно"
+
+        # Устанавливаем только указанный домен (заменяем все)
+        cursor.execute("UPDATE admins SET domains = ? WHERE id_vk = ?", (domain, id_vk))
+
+        # Записываем в историю
+        current_time = get_moscow_time().strftime("%d.%m.%Y %H:%M:%S")
+        cursor.execute("""
+            INSERT INTO domain_history (user_id, old_domain, new_domain, changed_by, changed_at)
+            VALUES (?, ?, ?, ?, ?)
+        """, (id_vk, old_domains, domain, message.from_id, current_time))
+
+        conn.commit()
+
+    await message.answer(f"✅ Домен для [https://vk.com/id{id_vk}|{name}] установлен: {domain}")
+
+@labeler.message(text="/dn del <user_arg> <domain>")
+async def dn_del(message: Message, user_arg: str, domain: str):
+    if message.peer_id != TARGET_PEER_ID:
+        return
+    user_level = get_admin_level(message.from_id)
+    if user_level < 3:
+        return await message.answer("❌ У вас нет прав управлять доменами.")
+
+    id_vk = await extract_user_id(user_arg)
+    if not id_vk:
+        return await message.answer("❌ Не удалось определить ID пользователя. Используйте ID, @упоминание или ссылку VK.")
+
+    with sqlite3.connect(DB_PATH) as conn:
+        cursor = conn.cursor()
+
+        # Получаем текущие домены
+        cursor.execute("SELECT domains, name FROM admins WHERE id_vk = ?", (id_vk,))
+        result = cursor.fetchone()
+        if not result:
+            return await message.answer("❌ Пользователь не найден в базе данных.")
+
+        old_domains = result[0] if result[0] else ''
+        name = result[1]
+
+        if not old_domains:
+            return await message.answer(f"❌ У [https://vk.com/id{id_vk}|{name}] нет доменов для удаления.")
+
+        # Удаляем указанный домен
+        domains_list = [d.strip() for d in old_domains.split(',') if d.strip()]
+        if domain not in domains_list:
+            return await message.answer(f"❌ Домен '{domain}' не найден у [https://vk.com/id{id_vk}|{name}]")
+
+        domains_list.remove(domain)
+        new_domains = ', '.join(domains_list) if domains_list else ''
+
+        # Обновляем домены
+        cursor.execute("UPDATE admins SET domains = ? WHERE id_vk = ?", (new_domains, id_vk))
+
+        # Записываем в историю
+        current_time = get_moscow_time().strftime("%d.%m.%Y %H:%M:%S")
+        cursor.execute("""
+            INSERT INTO domain_history (user_id, old_domain, new_domain, changed_by, changed_at)
+            VALUES (?, ?, ?, ?, ?)
+        """, (id_vk, old_domains, new_domains, message.from_id, current_time))
+
+        conn.commit()
+
+    await message.answer(f"✅ Домен '{domain}' удалён у [https://vk.com/id{id_vk}|{name}]")
+
+@labeler.message(text="/dn clear <user_arg>")
+async def dn_clear(message: Message, user_arg: str):
+    if message.peer_id != TARGET_PEER_ID:
+        return
+    user_level = get_admin_level(message.from_id)
+    if user_level < 3:
+        return await message.answer("❌ У вас нет прав управлять доменами.")
+
+    id_vk = await extract_user_id(user_arg)
+    if not id_vk:
+        return await message.answer("❌ Не удалось определить ID пользователя. Используйте ID, @упоминание или ссылку VK.")
+
+    with sqlite3.connect(DB_PATH) as conn:
+        cursor = conn.cursor()
+
+        # Получаем текущие домены
+        cursor.execute("SELECT domains, name FROM admins WHERE id_vk = ?", (id_vk,))
+        result = cursor.fetchone()
+        if not result:
+            return await message.answer("❌ Пользователь не найден в базе данных.")
+
+        old_domains = result[0] if result[0] else ''
+        name = result[1]
+
+        if not old_domains:
+            return await message.answer(f"❌ У [https://vk.com/id{id_vk}|{name}] нет доменов для удаления.")
+
+        # Очищаем все домены
+        cursor.execute("UPDATE admins SET domains = '' WHERE id_vk = ?", (id_vk,))
+
+        # Записываем в историю
+        current_time = get_moscow_time().strftime("%d.%m.%Y %H:%M:%S")
+        cursor.execute("""
+            INSERT INTO domain_history (user_id, old_domain, new_domain, changed_by, changed_at)
+            VALUES (?, ?, ?, ?, ?)
+        """, (id_vk, old_domains, '', message.from_id, current_time))
+
+        conn.commit()
+
+    await message.answer(f"✅ Все домены удалены у [https://vk.com/id{id_vk}|{name}]")
+
+@labeler.message(text="/dn get <domain>")
+async def dn_get(message: Message, domain: str):
+    if message.peer_id != TARGET_PEER_ID:
+        return
+    user_level = get_admin_level(message.from_id)
+    if user_level < 3:
+        return await message.answer("❌ У вас нет доступа к этой команде.")
+
+    with sqlite3.connect(DB_PATH) as conn:
+        cursor = conn.cursor()
+        cursor.execute("SELECT id_vk, name, domains FROM admins WHERE domains LIKE ?", (f'%{domain}%',))
+        users = cursor.fetchall()
+
+    matching_users = []
+    for uid, name, domains in users:
+        domains_list = [d.strip() for d in domains.split(',') if d.strip()]
+        if domain in domains_list:
+            matching_users.append((uid, name))
+
+    if not matching_users:
+        return await message.answer(f"❌ Домен '{domain}' не найден в конференции.")
+
+    text = f"ABot » Информация по домену '{domain}':\n\n"
+    for uid, name in matching_users:
+        text += f"[https://vk.com/id{uid}|{name}] (ID: {uid})\n"
+
+    await message.answer(text)
+
+@labeler.message(text="/dn")
+async def dn_help(message: Message):
+    if message.peer_id != TARGET_PEER_ID:
+        return
+    user_level = get_admin_level(message.from_id)
+    if user_level < 3:
+        return await message.answer("❌ У вас нет доступа к этой команде.")
+
+    await message.answer(
+        "ABot » Список доступных команд:\n\n"
+        "/dn <Аргумент>\n"
+        "/dn <Аргумент> <Домен>\n"
+        "/dn <Аргумент> <Пользователь>\n"
+        "/dn <Аргумент> <Пользователь> <Домен>\n\n"
+        "Список аргументов:\n"
+        "— 'consist_list' - список доменов в конференции\n"
+        "— 'add' - выдать домен пользователю в конференции\n"
+        "— 'set' - установить никнейм пользователю\n"
+        "— 'del' - удалить домен в конференции\n"
+        "— 'clear' - удалить домены пользователя в конференции\n"
+        "— 'get' - узнать информацию по домену в конференции"
+    )
+
+@labeler.message(text="/getall")
+async def get_all_users(message: Message):
+    if message.peer_id != TARGET_PEER_ID:
+        return
+
+    user_level = get_admin_level(message.from_id)
+    if user_level < 5:
+        return await message.answer("❌ У вас нет прав для просмотра информации о всех пользователях.")
+
+    with sqlite3.connect(DB_PATH) as conn:
+        cursor = conn.cursor()
+        cursor.execute("SELECT * FROM admins WHERE is_in_chat = 1 ORDER BY level DESC, name")
+        all_users = cursor.fetchall()
+
+    if not all_users:
+        return await message.answer("📝 В беседе нет пользователей.")
+
+    text = "ABot » Информация о всех пользователях в конференции:\n\n"
+
+    for user_data in all_users:
+        if len(user_data) >= 12:
+            (uid, name, level, server, domains, position, 
+             invited_at_str, first_invited_at_str, msg_count, is_in_chat, 
+             total_time_seconds, session_start) = user_data[:12]
+        else:
+            # Старый формат
+            uid, name, level, server = user_data[:4]
+            domains = user_data[4] if len(user_data) > 4 else ''
+            position = user_data[5] if len(user_data) > 5 else ''
+            invited_at_str = user_data[6] if len(user_data) > 6 else ''
+            first_invited_at_str = user_data[7] if len(user_data) > 7 else ''
+            msg_count = user_data[8] if len(user_data) > 8 else 0
+            is_in_chat = 1
+            total_time_seconds = 0
+            session_start = ''
+
+        # Форматируем данные
+        level_text = f"{level}" if level > 0 else "0"
+
+        if domains:
+            domains_list = [d.strip() for d in domains.split(',') if d.strip()]
+            domains_text = ', '.join(domains_list) if domains_list else "нет"
+        else:
+            domains_text = "нет"
+
+        position_text = position if position else "нет"
+        status_text = "в чате" if is_in_chat else "не в чате"
+
+        # Отображение времени приглашения
+        if invited_at_str and invited_at_str != '' and is_in_chat:
+            try:
+                invited_at_dt = datetime.strptime(invited_at_str, "%Y-%m-%d %H:%M:%S")
+                invited_at_display = invited_at_dt.strftime("%d.%m.%Y %H:%M")
+            except:
+                invited_at_display = "ошибка"
+        else:
+            invited_at_display = "нет данных"
+
+        text += f"👤 [https://vk.com/id{uid}|{name}]\n"
+        text += f"   Уровень: {level_text} | Сервер: {server} | Статус: {status_text}\n"
+        text += f"   Домены: {domains_text}\n"
+        text += f"   Должность: {position_text}\n"
+        text += f"   Сообщений: {msg_count} | Приглашён: {invited_at_display}\n\n"
+
+    # Разбиваем на части если текст слишком длинный
+    max_length = 4000
+    if len(text) > max_length:
+        parts = []
+        current_part = ""
+        lines = text.split('\n')
+
+        for line in lines:
+            if len(current_part) + len(line) + 1 > max_length:
+                if current_part:
+                    parts.append(current_part)
+                current_part = line
+            else:
+                current_part += '\n' + line if current_part else line
+
+        if current_part:
+            parts.append(current_part)
+
+        # Отправляем по частям
+        for i, part in enumerate(parts, 1):
+            part_header = f"ABot » Информация о всех пользователях (часть {i}/{len(parts)}):\n\n"
+            await message.answer(part_header + part.split('\n\n', 1)[1] if i > 1 else part)
+    else:
+        await message.answer(text)
+
+@labeler.message(text="/warn <user_arg> <warns_count:int> <reason>")
+async def warn_user_with_reason(message: Message, user_arg: str, warns_count: int, reason: str):
+    if message.peer_id != TARGET_PEER_ID:
+        return
+    if not check_command_access(message.from_id, 'warn'):
+        return await message.answer("⛔ У вас нет доступа к этой команде.")
+    user_level = get_admin_level(message.from_id)
+
+    if warns_count <= 0:
+        return await message.answer("❌ Количество предупреждений должно быть больше 0.")
+
+    id_vk = await extract_user_id(user_arg)
+    if not id_vk:
+        return await message.answer(
+            "❌ Не удалось определить ID пользователя.\n\n"
+            "📝 Использование команды:\n"
+            "/warn <Пользователь> <Кол-во пред.> <Причина>\n\n"
+            "💡 Пример:\n"
+            "/warn @id123456789 1 Нарушение правил"
+        )
+
+    target_level = get_admin_level(id_vk)
+    if target_level >= user_level:
+        return await message.answer("⛔ Вы не можете выдать предупреждение пользователю с уровнем равным или выше вашего.")
+
+    try:
+        user_info = await bot.api.users.get(user_ids=[id_vk])
+        name = f"{user_info[0].first_name} {user_info[0].last_name}"
+    except:
+        name = "Неизвестно"
+
+    # Создаем пользователя в БД если его нет
+    await get_user_data(id_vk, auto_track_join=False)
+
+    current_time = get_moscow_time().strftime("%d.%m.%Y %H:%M:%S")
+
+    with sqlite3.connect(DB_PATH) as conn:
+        cursor = conn.cursor()
+
+        # Получаем текущие предупреждения
+        cursor.execute("SELECT warns_count, kicks_count FROM warnings WHERE user_id = ?", (id_vk,))
+        result = cursor.fetchone()
+
+        if result:
+            old_warns, old_kicks = result
+            new_warns = old_warns + warns_count
+            new_kicks = old_kicks
+        else:
+            old_warns, old_kicks = 0, 0
+            new_warns = warns_count
+            new_kicks = 0
+            # Создаем запись
+            cursor.execute("INSERT INTO warnings (user_id, warns_count, kicks_count) VALUES (?, 0, 0)", (id_vk,))
+
+        # Проверяем превышение лимита предупреждений (2 предупреждения = 1 выговор)
+        if new_warns >= 2:
+            kicks_to_add = new_warns // 2
+            new_kicks += kicks_to_add
+            new_warns = new_warns % 2
+
+            # Обновляем предупреждения
+            cursor.execute("UPDATE warnings SET warns_count = ?, kicks_count = ? WHERE user_id = ?", 
+                         (new_warns, new_kicks, id_vk))
+
+            # Записываем в историю
+            cursor.execute("""
+                INSERT INTO warning_history (user_id, action_type, warns_change, kicks_change, reason, issued_by, issued_at)
+                VALUES (?, 'warn', ?, ?, ?, ?, ?)
+            """, (id_vk, warns_count, kicks_to_add, reason, message.from_id, current_time))
+
+            conn.commit()
+
+            # Проверяем автоматический кик при 3 выговорах
+            if new_kicks >= 3:
+                try:
+                    # Блокируем пользователя (добавляем в чёрный список)
+                    cursor.execute("""
+                        CREATE TABLE IF NOT EXISTS blacklisted_users (
+                            user_id INTEGER PRIMARY KEY,
+                            banned_at TEXT NOT NULL,
+                            banned_by INTEGER NOT NULL,
+                            reason TEXT DEFAULT ''
+                        )
+                    """)
+
+                    cursor.execute("""
+                        INSERT OR REPLACE INTO blacklisted_users (user_id, banned_at, banned_by, reason)
+                        VALUES (?, ?, ?, ?)
+                    """, (id_vk, current_time, message.from_id, f"Автоматический кик: {reason}"))
+
+                    conn.commit()
+
+                    # Кикаем из беседы
+                    await bot.api.messages.remove_chat_user(
+                        chat_id=message.peer_id - 2000000000,
+                        member_id=id_vk
+                    )
+
+                    # Обновляем статус в БД
+                    handle_user_leave(id_vk)
+
+                    kick_text = f" (получено {kicks_to_add} выговора)"
+                    await message.answer(f"🔴 [https://vk.com/id{id_vk}|{name}] получил {warns_count} предупреждение(й){kick_text}\n📝 Причина: {reason}\n\n⚠️ АВТОМАТИЧЕСКИЙ КИК: Превышен лимит выговоров (3/3)\n🚫 Пользователь заблокирован и исключён из беседы!")
+
+                except Exception as e:
+                    kick_text = f" (получено {kicks_to_add} выговора)"
+                    await message.answer(f"🔴 [https://vk.com/id{id_vk}|{name}] получил {warns_count} предупреждение(й){kick_text}\n📝 Причина: {reason}\n\n⚠️ ЛИМИТ ПРЕВЫШЕН (3/3) - требуется кик!\n❌ Ошибка автоматического исключения: {str(e)}")
+            else:
+                kick_text = f" (получен {kicks_to_add} выговор)" if kicks_to_add == 1 else f" (получено {kicks_to_add} выговора)"
+                await message.answer(f"⚠️ [https://vk.com/id{id_vk}|{name}] получил {warns_count} предупреждение(й){kick_text}\n📝 Причина: {reason}\n\n📊 Текущие показатели: выг: {new_kicks}/3, пред: {new_warns}/2")
+        else:
+            # Обновляем только предупреждения
+            cursor.execute("UPDATE warnings SET warns_count = ? WHERE user_id = ?", (new_warns, id_vk))
+
+            # Записываем в историю
+            cursor.execute("""
+                INSERT INTO warning_history (user_id, action_type, warns_change, kicks_change, reason, issued_by, issued_at)
+                VALUES (?, 'warn', ?, 0, ?, ?, ?)
+            """, (id_vk, warns_count, reason, message.from_id, current_time))
+
+            conn.commit()
+
+            await message.answer(f"⚠️ [https://vk.com/id{id_vk}|{name}] получил {warns_count} предупреждение(й)\n📝 Причина: {reason}\n\n📊 Текущие показатели: выг: {new_kicks}/3, пред: {new_warns}/2")
+
+@labeler.message(text="/warn <user_arg> <warns_count:int>")
+async def warn_user_no_reason(message: Message, user_arg: str, warns_count: int):
+    await warn_user_with_reason(message, user_arg, warns_count, "не указана")
+
+@labeler.message(text="/warn")
+async def warn_help(message: Message):
+    if message.peer_id != TARGET_PEER_ID:
+        return
+    if not check_command_access(message.from_id, 'warn'):
+        return await message.answer("⛔ У вас нет доступа к этой команде.")
+
+    await message.answer("ABot » Использование: /warn <Ссылка на профиль> <Кол-во пред.> <Причина>")
+
+@labeler.message(text="/unwarn <user_arg> <warns_count:int> <reason>")
+async def unwarn_user_with_reason(message: Message, user_arg: str, warns_count: int, reason: str):
+    if message.peer_id != TARGET_PEER_ID:
+        return
+    if not check_command_access(message.from_id, 'unwarn'):
+        return await message.answer("⛔ У вас нет доступа к этой команде.")
+    user_level = get_admin_level(message.from_id)
+
+    if warns_count <= 0:
+        return await message.answer("❌ Количество предупреждений должно быть больше 0.")
+
+    id_vk = await extract_user_id(user_arg)
+    if not id_vk:
+        return await message.answer(
+            "❌ Не удалось определить ID пользователя.\n\n"
+            "📝 Использование команды:\n"
+            "/unwarn <Пользователь> <Кол-во пред.> <Причина (Необязательно)>\n\n"
+            "💡 Пример:\n"
+            "/unwarn @id123456789 1 Ошибочно выдан"
+        )
+
+    try:
+        user_info = await bot.api.users.get(user_ids=[id_vk])
+        name = f"{user_info[0].first_name} {user_info[0].last_name}"
+    except:
+        name = "Неизвестно"
+
+    current_time = get_moscow_time().strftime("%d.%m.%Y %H:%M:%S")
+
+    with sqlite3.connect(DB_PATH) as conn:
+        cursor = conn.cursor()
+
+        # Получаем текущие предупреждения
+        cursor.execute("SELECT warns_count, kicks_count FROM warnings WHERE user_id = ?", (id_vk,))
+        result = cursor.fetchone()
+
+        if not result:
+            return await message.answer(f"❌ У [https://vk.com/id{id_vk}|{name}] нет предупреждений.")
+
+        old_warns, old_kicks = result
+
+        if old_warns == 0 and old_kicks == 0:
+            return await message.answer(f"❌ У [https://vk.com/id{id_vk}|{name}] нет предупреждений для снятия.")
+
+        # Рассчитываем сколько предупреждений снять
+        total_warns_to_remove = warns_count
+        current_warns = old_warns
+        current_kicks = old_kicks
+
+        # Сначала снимаем текущие предупреждения
+        if current_warns > 0:
+            warns_removed = min(current_warns, total_warns_to_remove)
+            current_warns -= warns_removed
+            total_warns_to_remove -= warns_removed
+
+        # Если ещё остались предупреждения для снятия, переводим выговоры в предупреждения
+        if total_warns_to_remove > 0 and current_kicks > 0:
+            kicks_to_convert = min(current_kicks, (total_warns_to_remove + 1) // 2)
+            current_kicks -= kicks_to_convert
+            # Каждый выговор = 2 предупреждения, но мы их снимаем
+            warnings_from_kicks = kicks_to_convert * 2
+            actual_removed = min(warnings_from_kicks, total_warns_to_remove)
+            current_warns = actual_removed # Просто добавляем снятые предупреждения
+
+        # Обновляем предупреждения
+        cursor.execute("UPDATE warnings SET warns_count = ?, kicks_count = ? WHERE user_id = ?", (current_warns, current_kicks, id_vk))
+
+        # Записываем в историю
+        cursor.execute("""
+            INSERT INTO warning_history (user_id, action_type, warns_change, kicks_change, reason, issued_by, issued_at)
+            VALUES (?, 'unwarn', ?, 0, ?, ?, ?)
+        """, (id_vk, -warns_count, reason, message.from_id, current_time))
+
+        conn.commit()
+
+        await message.answer(f"✅ У [https://vk.com/id{id_vk}|{name}] снято {warns_count} предупреждение(й)\n📝 Причина: {reason}\n\n📊 Текущие показатели: выг: {current_kicks}/3, пред: {current_warns}/2")
+
+@labeler.message(text="/unwarn <user_arg> <warns_count:int>")
+async def unwarn_user_no_reason(message: Message, user_arg: str, warns_count: int):
+    await unwarn_user_with_reason(message, user_arg, warns_count, "не указана")
+
+@labeler.message(text="/unwarn")
+async def unwarn_help(message: Message):
+    if message.peer_id != TARGET_PEER_ID:
+        return
+    if not check_command_access(message.from_id, 'unwarn'):
+        return await message.answer("❌ У вас нет доступа к этой команде.")
+
+    await message.answer("ABot » Использование: /unwarn <Ссылка на профиль> <Кол-во пред.> <Причина (Необязательно)>")
+
+@labeler.message(text="/warns <page:int>")
+async def warns_list_with_page(message: Message, page: int):
+    if message.peer_id != TARGET_PEER_ID:
+        return
+    if not check_command_access(message.from_id, 'warns'):
+        return await message.answer("⛔ У вас нет доступа к этой команде.")
+
+    with sqlite3.connect(DB_PATH) as conn:
+        cursor = conn.cursor()
+        cursor.execute("""
+            SELECT w.user_id, a.name, w.kicks_count, w.warns_count
+            FROM warnings w
+            JOIN admins a ON w.user_id = a.id_vk
+            WHERE (w.warns_count > 0 OR w.kicks_count > 0)
+            ORDER BY w.kicks_count DESC, w.warns_count DESC
+        """)
+        users_with_warns = cursor.fetchall()
+
+    if not users_with_warns:
+        return await message.answer("ABot » Предупреждения пользователей. Страница: 1/1\n\nНет пользователей с предупреждениями.")
+
+    per_page = 10
+    total_pages = (len(users_with_warns) + per_page - 1) // per_page
+
+    if page < 1 or page > total_pages:
+        return await message.answer(f"❌ Страница {page} не найдена. Доступно страниц: {total_pages}")
+
+    start = (page - 1) * per_page
+    users_slice = users_with_warns[start:start + per_page]
+
+    text = f"ABot » Предупреждения пользователей. Страница: {page}/{total_pages}\n\n"
+
+    for i, (uid, name, kicks, warns) in enumerate(users_slice, start=start + 1):
+        text += f"{i}. [https://vk.com/id{uid}|{name}], выг: {kicks}/3, пред: {warns}/2\n"
+
+    await message.answer(text)
+
+@labeler.message(text="/warns")
+async def warns_list_first_page(message: Message):
+    if not check_command_access(message.from_id, 'warns'):
+        return await message.answer("⛔ У вас нет доступа к этой команде.")
+    await warns_list_with_page(message, 1)
+
+@labeler.message(text="/warnlist <user_arg> <page:int>")
+async def warnlist_with_page(message: Message, user_arg: str, page: int):
+    if message.peer_id != TARGET_PEER_ID:
+        return
+    if not check_command_access(message.from_id, 'warnlist'):
+        return await message.answer("⛔ У вас нет доступа к этой команде.")
+
+    id_vk = await extract_user_id(user_arg)
+    if not id_vk:
+        return await message.answer(
+            "❌ Не удалось определить ID пользователя.\n\n"
+            "📝 Использование команды:\n"
+            "/warnlist <Ссылка на профиль> <Страница (Необязательно)>\n\n"
+            "💡 Пример:\n"
+            "/warnlist @id123456789\n"
+            "/warnlist @id123456789 2"
+        )
+
+    try:
+        user_info = await bot.api.users.get(user_ids=[id_vk])
+        name = f"{user_info[0].first_name} {user_info[0].last_name}"
+    except:
+        name = "Неизвестно"
+
+    with sqlite3.connect(DB_PATH) as conn:
+        cursor = conn.cursor()
+        cursor.execute("""
+            SELECT action_type, warns_change, kicks_change, reason, issued_by, issued_at
+            FROM warning_history
+            WHERE user_id = ?
+            ORDER BY id DESC
+        """, (id_vk,))
+        history = cursor.fetchall()
+
+    if not history:
+        return await message.answer(f"ABot » История предупреждений для [https://vk.com/id{id_vk}|{name}]:\n\nИстория пуста.")
+
+    per_page = 10
+    total_pages = (len(history) + per_page - 1) // per_page
+
+    if page < 1 or page > total_pages:
+        return await message.answer(f"❌ Страница {page} не найдена. Доступно страниц: {total_pages}")
+
+    start = (page - 1) * per_page
+    history_slice = history[start:start + per_page]
+
+    text = f"ABot » История предупреждений для [https://vk.com/id{id_vk}|{name}] (страница {page}/{total_pages}):\n\n"
+
+    for action_type, warns_change, kicks_change, reason, issued_by, issued_at in history_slice:
+        try:
+            issuer_info = await bot.api.users.get(user_ids=[issued_by])
+            issuer_name = f"{issuer_info[0].first_name} {issuer_info[0].last_name}"
+        except:
+            issuer_name = "Неизвестно"
+
+        action_text = "Выдано" if action_type == "warn" else "Снято"
+        warns_text = f"{abs(warns_change)} пред."
+
+        if kicks_change > 0:
+            warns_text += f" (получен {kicks_change} выговор)"
+
+        text += f"[{issued_at}] {action_text}: {warns_text}\n"
+        text += f"Причина: {reason}\n"
+        text += f"Кем: [https://vk.com/id{issued_by}|{issuer_name}]\n\n"
+
+    await message.answer(text)
+
+@labeler.message(text="/warnlist <user_arg>")
+async def warnlist_first_page(message: Message, user_arg: str):
+    if not check_command_access(message.from_id, 'warnlist'):
+        return await message.answer("⛔ У вас нет доступа к этой команде.")
+    await warnlist_with_page(message, user_arg, 1)
+
+@labeler.message(text="/warnlist")
+async def warnlist_help(message: Message):
+    if message.peer_id != TARGET_PEER_ID:
+        return
+    if not check_command_access(message.from_id, 'warnlist'):
+        return await message.answer("❌ У вас нет доступа к этой команде.")
+
+    await message.answer("ABot » Использование: /warnlist <Ссылка на профиль> <Страница (Необязательно)>")
+
+@labeler.message(text="/mywarns <page:int>")
+async def my_warns_with_page(message: Message, page: int):
+    if message.peer_id != TARGET_PEER_ID:
+        return
+
+    # Любой пользователь может смотреть свои предупреждения
+    id_vk = message.from_id
+
+    try:
+        user_info = await bot.api.users.get(user_ids=[id_vk])
+        name = f"{user_info[0].first_name} {user_info[0].last_name}"
+    except:
+        name = "Неизвестно"
+
+    with sqlite3.connect(DB_PATH) as conn:
+        cursor = conn.cursor()
+
+        # Получаем текущее состояние предупреждений
+        cursor.execute("SELECT warns_count, kicks_count FROM warnings WHERE user_id = ?", (id_vk,))
+        current_warns = cursor.fetchone()
+
+        if current_warns:
+            warns, kicks = current_warns
+        else:
+            warns, kicks = 0, 0
+
+        # Получаем историю предупреждений
+        cursor.execute("""
+            SELECT action_type, warns_change, kicks_change, reason, issued_by, issued_at
+            FROM warning_history
+            WHERE user_id = ?
+            ORDER BY id DESC
+        """, (id_vk,))
+        history = cursor.fetchall()
+
+    if not history and warns == 0 and kicks == 0:
+        return await message.answer("ABot » Ваши предупреждения:\n\n✅ У вас нет предупреждений!")
+
+    per_page = 10
+    total_pages = (len(history) + per_page - 1) // per_page if history else 1
+
+    if page < 1 or page > total_pages:
+        return await message.answer(f"❌ Страница {page} не найдена. Доступно страниц: {total_pages}")
+
+    text = f"ABot » Ваши предупреждения:\n\n📊 Текущее состояние: выг: {kicks}/3, пред: {warns}/2\n\n"
+
+    if history:
+        start = (page - 1) * per_page
+        history_slice = history[start:start + per_page]
+
+        text += f"📋 История (страница {page}/{total_pages}):\n\n"
+
+        for action_type, warns_change, kicks_change, reason, issued_by, issued_at in history_slice:
+            try:
+                issuer_info = await bot.api.users.get(user_ids=[issued_by])
+                issuer_name = f"{issuer_info[0].first_name} {issuer_info[0].last_name}"
+            except:
+                issuer_name = "Неизвестно"
+
+            action_text = "Выдано" if action_type == "warn" else "Снято"
+            warns_text = f"{abs(warns_change)} пред."
+
+            if kicks_change > 0:
+                warns_text += f" (получен {kicks_change} выговор)"
+
+            text += f"[{issued_at}] {action_text}: {warns_text}\n"
+            text += f"Причина: {reason}\n"
+            text += f"Кем: [https://vk.com/id{issued_by}|{issuer_name}]\n\n"
+    else:
+        text += "📋 История предупреждений пуста."
+
+    await message.answer(text)
+
+@labeler.message(text="/mywarns")
+async def my_warns_first_page(message: Message):
+    await my_warns_with_page(message, 1)
+
+@labeler.message(text="/unblock <user_arg> <reason>")
+async def unblock_user_with_reason(message: Message, user_arg: str, reason: str):
+    if message.peer_id != TARGET_PEER_ID:
+        return
+    if not check_command_access(message.from_id, 'unblock'):
+        return await message.answer("❌ У вас нет прав разблокировать пользователей.")
+
+    id_vk = await extract_user_id(user_arg)
+    if not id_vk:
+        return await message.answer(
+            "❌ Не удалось определить ID пользователя.\n\n"
+            "📝 Использование команды:\n"
+            "/unblock <Пользователь> <Причина>\n\n"
+            "💡 Пример:\n"
+            "/unblock @id123456789 Реабилитация"
+        )
+
+    try:
+        user_info = await bot.api.users.get(user_ids=[id_vk])
+        name = f"{user_info[0].first_name} {user_info[0].last_name}"
+    except:
+        name = "Неизвестно"
+
+    current_time = get_moscow_time().strftime("%d.%m.%Y %H:%M:%S")
+
+    with sqlite3.connect(DB_PATH) as conn:
+        cursor = conn.cursor()
+
+        # Проверяем, заблокирован ли пользователь
+        cursor.execute("SELECT banned_at FROM blacklisted_users WHERE user_id = ?", (id_vk,))
+        blocked = cursor.fetchone()
+
+        if not blocked:
+            return await message.answer(f"❌ [https://vk.com/id{id_vk}|{name}] не находится в чёрном списке.")
+
+        # Убираем из чёрного списка
+        cursor.execute("DELETE FROM blacklisted_users WHERE user_id = ?", (id_vk,))
+
+        # Сбрасываем предупреждения и выговоры
+        cursor.execute("UPDATE warnings SET warns_count = 0, kicks_count = 0 WHERE user_id = ?", (id_vk,))
+
+        # Записываем в историю разблокировки
+        cursor.execute("""
+            INSERT INTO warning_history (user_id, action_type, warns_change, kicks_change, reason, issued_by, issued_at)
+            VALUES (?, 'unblock', 0, 0, ?, ?, ?)
+        """, (id_vk, reason, message.from_id, current_time))
+
+        conn.commit()
+
+    await message.answer(f"✅ [https://vk.com/id{id_vk}|{name}] разблокирован и может быть приглашён в беседу\n📝 Причина разблокировки: {reason}\n🔄 Все предупреждения и выговоры сброшены")
+
+@labeler.message(text="/unblock <user_arg>")
+async def unblock_user_no_reason(message: Message, user_arg: str):
+    await unblock_user_with_reason(message, user_arg, "не указана")
+
+@labeler.message(text="/unblock")
+async def unblock_help(message: Message):
+    if message.peer_id != TARGET_PEER_ID:
+        return
+    if not check_command_access(message.from_id, 'unblock'):
+        return await message.answer("❌ У вас нет прав разблокировать пользователей.")
+
+    await message.answer(
+        "ABot » Использование команды /unblock:\n\n"
+        "/unblock <Пользователь>\n"
+        "/unblock <Пользователь> <Причина>\n\n"
+        "💡 Пример использования:\n"
+        "/unblock @id123456789\n"
+        "/unblock 123456789 Реабилитация\n"
+        "/unblock https://vk.com/id123456789 Ошибочная блокировка"
+    )
+
+@labeler.message(text="/blocked")
+async def blocked_list(message: Message):
+    if message.peer_id != TARGET_PEER_ID:
+        return
+    if not check_command_access(message.from_id, 'blocked'):
+        return await message.answer("❌ У вас нет доступа к этой команде.")
+
+    with sqlite3.connect(DB_PATH) as conn:
+        cursor = conn.cursor()
+        cursor.execute("""
+            SELECT b.user_id, a.name, b.banned_at, b.reason, b.banned_by
+            FROM blacklisted_users b
+            LEFT JOIN admins a ON b.user_id = a.id_vk
+            ORDER BY b.banned_at DESC
+        """)
+        blocked_users = cursor.fetchall()
+
+    if not blocked_users:
+        return await message.answer("ABot » Чёрный список пуст.")
+
+    text = "ABot » Заблокированные пользователи:\n\n"
+    for uid, name, banned_at, reason, banned_by in blocked_users:
+        user_name = name if name else "Неизвестно"
+
+        # Получаем имя заблокировавшего
+        try:
+            banner_info = await bot.api.users.get(user_ids=[banned_by])
+            banner_name = f"{banner_info[0].first_name} {banner_info[0].last_name}"
+        except:
+            banner_name = "Неизвестно"
+
+        text += f"🚫 [https://vk.com/id{uid}|{user_name}]\n"
+        text += f"   Заблокирован: {banned_at}\n"
+        text += f"   Причина: {reason}\n"
+        text += f"   Кем: [https://vk.com/id{banned_by}|{banner_name}]\n\n"
+
+    await message.answer(text)
+
+@labeler.message(text="/mute <user_arg> <duration> <reason>")
+async def mute_user_with_duration_reason(message: Message, user_arg: str, duration: str, reason: str):
+    if message.peer_id != TARGET_PEER_ID:
+        return
+    if not check_command_access(message.from_id, 'mute'):
+        return await message.answer("❌ У вас нет прав заглушать пользователей.")
+
+    id_vk = await extract_user_id(user_arg)
+    if not id_vk:
+        return await message.answer(
+            "❌ Не удалось определить ID пользователя.\n\n"
+            "📝 Использование команды:\n"
+            "/mute <Пользователь> <Время> <Причина>\n"
+            "/mute <Пользователь> навсегда <Причина>\n\n"
+            "💡 Пример:\n"
+            "/mute @id123456789 30м Спам\n"
+            "/mute 123456789 1ч Нарушение правил\n"
+            "/mute https://vk.com/id123456789 навсегда Флуд"
+        )
+
+    target_level = get_admin_level(id_vk)
+    if target_level >= get_admin_level(message.from_id):
+        return await message.answer("⛔ Вы не можете заглушить пользователя с уровнем равным или выше вашего.")
+
+    try:
+        user_info = await bot.api.users.get(user_ids=[id_vk])
+        name = f"{user_info[0].first_name} {user_info[0].last_name}"
+    except:
+        name = "Неизвестно"
+
+    # Создаем пользователя в БД если его нет
+    await get_user_data(id_vk, auto_track_join=False)
+
+    current_time = get_moscow_time()
+    current_time_str = current_time.strftime("%d.%m.%Y %H:%M:%S")
+
+    # Парсим длительность заглушения
+    muted_until = ""
+    duration_text = ""
+
+    if duration.lower() in ["навсегда", "forever", "permanent"]:
+        muted_until = ""
+        duration_text = "навсегда"
+    else:
+        # Парсим время (30м, 1ч, 2д и т.д.)
+        import re
+        time_match = re.match(r'(\d+)([мчдhmd])', duration.lower())
+        if time_match:
+            amount = int(time_match.group(1))
+            unit = time_match.group(2)
+
+            if unit in ['м', 'm']:
+                delta = timedelta(minutes=amount)
+                duration_text = f"{amount} минут"
+            elif unit in ['ч', 'h']:
+                delta = timedelta(hours=amount)
+                duration_text = f"{amount} часов"
+            elif unit in ['д', 'd']:
+                delta = timedelta(days=amount)
+                duration_text = f"{amount} дней"
+            else:
+                return await message.answer("❌ Неверный формат времени. Используйте: 30м, 1ч, 2д или 'навсегда'")
+
+            muted_until_dt = current_time + delta
+            muted_until = muted_until_dt.strftime("%Y-%m-%d %H:%M:%S")
+        else:
+            return await message.answer("❌ Неверный формат времени. Используйте: 30м, 1ч, 2д или 'навсегда'")
+
+    with sqlite3.connect(DB_PATH) as conn:
+        cursor = conn.cursor()
+
+        # Проверяем, не заглушен ли уже пользователь
+        cursor.execute("SELECT muted_at FROM muted_users WHERE user_id = ?", (id_vk,))
+        already_muted = cursor.fetchone()
+
+        if already_muted:
+            return await message.answer(f"❌ [https://vk.com/id{id_vk}|{name}] уже заглушен.")
+
+        # Добавляем в список заглушенных
+        cursor.execute("""
+            INSERT INTO muted_users (user_id, muted_at, muted_by, muted_until, reason)
+            VALUES (?, ?, ?, ?, ?)
+        """, (id_vk, current_time_str, message.from_id, muted_until, reason))
+
+        conn.commit()
+
+    await message.answer(f"🔇 [https://vk.com/id{id_vk}|{name}] заглушен на {duration_text}\n📝 Причина: {reason}")
+
+@labeler.message(text="/mute <user_arg> <duration>")
+async def mute_user_with_duration(message: Message, user_arg: str, duration: str):
+    await mute_user_with_duration_reason(message, user_arg, duration, "не указана")
+
+@labeler.message(text="/mute <user_arg>")
+async def mute_user_no_duration(message: Message, user_arg: str):
+    if message.peer_id != TARGET_PEER_ID:
+        return
+    if not check_command_access(message.from_id, 'mute'):
+        return await message.answer("❌ У вас нет прав заглушать пользователей.")
+
+    await message.answer(
+        "📝 Использование команды /mute:\n\n"
+        "/mute <Пользователь> <Время> <Причина (необязательно)>\n\n"
+        "⏰ Формат времени:\n"
+        "• 30м - 30 минут\n"
+        "• 1ч - 1 час\n"
+        "• 2д - 2 дня\n"
+        "• навсегда - постоянная заглушка\n\n"
+        "💡 Пример использования:\n"
+        "/mute @id123456789 30м Спам\n"
+        "/mute 123456789 1ч\n"
+        "/mute https://vk.com/id123456789 навсегда Флуд"
+    )
+
+@labeler.message(text="/mute")
+async def mute_help(message: Message):
+    if message.peer_id != TARGET_PEER_ID:
+        return
+    if not check_command_access(message.from_id, 'mute'):
+        return await message.answer("❌ У вас нет прав заглушать пользователей.")
+
+    await message.answer(
+        "📝 Использование команды /mute:\n\n"
+        "/mute <Пользователь> <Время> <Причина (необязательно)>\n\n"
+        "⏰ Формат времени:\n"
+        "• 30м - 30 минут\n"
+        "• 1ч - 1 час\n"
+        "• 2д - 2 дня\n"
+        "• навсегда - постоянная заглушка\n\n"
+        "💡 Пример использования:\n"
+        "/mute @id123456789 30м Спам\n"
+        "/mute 123456789 1ч\n"
+        "/mute https://vk.com/id123456789 навсегда Флуд"
+    )
+
+@labeler.message(text="/unmute <user_arg> <reason>")
+async def unmute_user_with_reason(message: Message, user_arg: str, reason: str):
+    if message.peer_id != TARGET_PEER_ID:
+        return
+    if not check_command_access(message.from_id, 'unmute'):
+        return await message.answer("❌ У вас нет прав снимать заглушку с пользователей.")
+
+    id_vk = await extract_user_id(user_arg)
+    if not id_vk:
+        return await message.answer(
+            "❌ Не удалось определить ID пользователя.\n\n"
+            "📝 Использование команды:\n"
+            "/unmute <Пользователь> <Причина (необязательно)>\n\n"
+            "💡 Пример:\n"
+            "/unmute @id123456789 Исправился"
+        )
+
+    try:
+        user_info = await bot.api.users.get(user_ids=[id_vk])
+        name = f"{user_info[0].first_name} {user_info[0].last_name}"
+    except:
+        name = "Неизвестно"
+
+    with sqlite3.connect(DB_PATH) as conn:
+        cursor = conn.cursor()
+
+        # Проверяем, заглушен ли пользователь
+        cursor.execute("SELECT muted_at FROM muted_users WHERE user_id = ?", (id_vk,))
+        muted = cursor.fetchone()
+
+        if not muted:
+            return await message.answer(f"❌ [https://vk.com/id{id_vk}|{name}] не заглушен.")
+
+        # Убираем заглушку
+        cursor.execute("DELETE FROM muted_users WHERE user_id = ?", (id_vk,))
+        conn.commit()
+
+    await message.answer(f"🔊 Заглушка снята с [https://vk.com/id{id_vk}|{name}]\n📝 Причина: {reason}")
+
+@labeler.message(text="/unmute <user_arg>")
+async def unmute_user_no_reason(message: Message, user_arg: str):
+    await unmute_user_with_reason(message, user_arg, "не указана")
+
+@labeler.message(text="/unmute")
+async def unmute_help(message: Message):
+    if message.peer_id != TARGET_PEER_ID:
+        return
+    if not check_command_access(message.from_id, 'unmute'):
+        return await message.answer("❌ У вас нет прав снимать заглушку с пользователей.")
+
+    await message.answer(
+        "📝 Использование команды /unmute:\n\n"
+        "/unmute <Пользователь>\n"
+        "/unmute <Пользователь> <Причина>\n\n"
+        "💡 Пример использования:\n"
+        "/unmute @id123456789\n"
+        "/unmute 123456789 Исправился\n"
+        "/unmute https://vk.com/id123456789 Ошибочная заглушка"
+    )
+
+@labeler.message(text="/muted")
+async def muted_list(message: Message):
+    if message.peer_id != TARGET_PEER_ID:
+        return
+    if not check_command_access(message.from_id, 'muted'):
+        return await message.answer("❌ У вас нет доступа к этой команде.")
+
+    current_time = get_moscow_time()
+
+    with sqlite3.connect(DB_PATH) as conn:
+        cursor = conn.cursor()
+        cursor.execute("""
+            SELECT m.user_id, a.name, m.muted_at, m.muted_until, m.reason, ma.name as muted_by_name
+            FROM muted_users m
+            LEFT JOIN admins a ON m.user_id = a.id_vk
+            LEFT JOIN admins ma ON m.muted_by = ma.id_vk
+            ORDER BY m.muted_at DESC
+        """)
+        muted_users = cursor.fetchall()
+
+    if not muted_users:
+        return await message.answer("ABot » Список заглушенных пользователей пуст.")
+
+    text = "ABot » Заглушенные пользователи:\n\n"
+    expired_users = []
+
+    for uid, name, muted_at, muted_until, reason, muted_by_name in muted_users:
+        user_name = name if name else "Неизвестно"
+        muter_name = muted_by_name if muted_by_name else "Неизвестно"
+
+        # Проверяем не истекла ли заглушка
+        is_expired = False
+        if muted_until and muted_until != '':
+            try:
+                until_dt = datetime.strptime(muted_until, "%Y-%m-%d %H:%M:%S")
+                until_dt = until_dt.replace(tzinfo=MSK_TZ)
+                if current_time > until_dt:
+                    is_expired = True
+                    expired_users.append(uid)
+            except:
+                pass
+
+        if is_expired:
+            continue  # Пропускаем истёкшие заглушки
+
+        text += f"🔇 [https://vk.com/id{uid}|{user_name}]\n"
+        text += f"   Заглушен: {muted_at}\n"
+
+        if muted_until and muted_until != '':
+            try:
+                until_dt = datetime.strptime(muted_until, "%Y-%m-%d %H:%M:%S")
+                until_display = until_dt.strftime("%d.%m.%Y %H:%M")
+                text += f"   До: {until_display}\n"
+            except:
+                text += f"   До: навсегда\n"
+        else:
+            text += f"   До: навсегда\n"
+
+        text += f"   Причина: {reason}\n"
+        text += f"   Кем: [https://vk.com/id{muted_by_name}|{muter_name}]\n\n"
+
+    # Удаляем истёкшие заглушки
+    if expired_users:
+        cursor.execute(f"DELETE FROM muted_users WHERE user_id IN ({','.join(['?' for _ in expired_users])})", expired_users)
+        conn.commit()
+
+    if text == "ABot » Заглушенные пользователи:\n\n":
+        text = "ABot » Список заглушенных пользователей пуст."
+
+    await message.answer(text)
+
+@labeler.message(text="/top <page:int>")
+async def top_users_with_page(message: Message, page: int):
+    if message.peer_id != TARGET_PEER_ID:
+        return
+    if not check_command_access(message.from_id, 'top'):
+        return await message.answer("❌ У вас нет доступа к этой команде.")
+
+    with sqlite3.connect(DB_PATH) as conn:
+        cursor = conn.cursor()
+        cursor.execute("""
+            SELECT id_vk, name, msg_count 
+            FROM admins 
+            WHERE msg_count > 0 AND is_in_chat = 1
+            ORDER BY msg_count DESC
+        """)
+        all_users = cursor.fetchall()
+
+    if not all_users:
+        return await message.answer("📊 Статистика сообщений пуста.")
+
+    per_page = 20
+    total_pages = (len(all_users) + per_page - 1) // per_page
+
+    if page < 1 or page > total_pages:
+        return await message.answer(f"❌ Страница {page} не найдена. Доступно страниц: {total_pages}")
+
+    # Находим место запрашивающего в общем рейтинге
+    requester_place = None
+    requester_info = None
+    for i, (uid, name, msg_count) in enumerate(all_users, 1):
+        if uid == message.from_id:
+            requester_place = i
+            requester_info = (name, msg_count)
+            break
+
+    start = (page - 1) * per_page
+    users_slice = all_users[start:start + per_page]
+
+    text = f"ABot » Топ пользователей по количеству сообщений ({page}/{total_pages}):\n\n"
+
+    # Показываем место запрашивающего, если он есть в рейтинге
+    if requester_place and requester_info:
+        text += f"Ваше место: {requester_place}. [https://vk.com/id{message.from_id}|{requester_info[0]}] — сообщений: {requester_info[1]}\n\n"
+
+    for i, (uid, name, msg_count) in enumerate(users_slice, start=start + 1):
+        text += f"{i}. [https://vk.com/id{uid}|{name}] — сообщений: {msg_count}\n"
+
+    await message.answer(text)
+
+# Новая команда: /b_date
+@labeler.message(text="/b_date")
+async def b_date_command(message: Message):
+    if message.peer_id != TARGET_PEER_ID:
+        return
+    
+    # Исправлено: убран "await", так как get_admin_level не является асинхронной функцией
+    user_level = get_admin_level(message.from_id)
+    if user_level < 0: # Доступна всем
+        return await message.answer("⛔ У вас нет доступа к этой команде.")
+    
+    try:
+        # Получаем всех пользователей из БД
+        with sqlite3.connect(DB_PATH) as conn:
+            cursor = conn.cursor()
+            cursor.execute("SELECT id_vk FROM admins")
+            users_in_db = [row[0] for row in cursor.fetchall()]
+        
+        # Если в базе нет пользователей, завершаем
+        if not users_in_db:
+            return await message.answer("🤔 В базе данных нет пользователей.")
+
+        birthdays = []
+        now = get_moscow_time()
+        
+        # Запрашиваем информацию о днях рождения через API
+        user_info_list = await bot.api.users.get(user_ids=users_in_db, fields=["bdate"])
+        
+        for user_info in user_info_list:
+            if user_info.bdate:
+                # bdate может быть в формате "DD.MM" или "DD.MM.YYYY"
+                bdate_parts = user_info.bdate.split('.')
+                
+                # Если день рождения указан
+                if len(bdate_parts) >= 2:
+                    try:
+                        day = int(bdate_parts[0])
+                        month = int(bdate_parts[1])
+
+                        # Создаем дату дня рождения в этом году
+                        bday_this_year = now.replace(month=month, day=day)
+
+                        # Если день рождения уже прошел в этом году, проверяем следующий
+                        if bday_this_year < now:
+                            bday_this_year = bday_this_year.replace(year=now.year + 1)
+                        
+                        birthdays.append({
+                            'date': bday_this_year,
+                            'name': f"[id{user_info.id}|{user_info.first_name} {user_info.last_name}]"
+                        })
+                    except (ValueError, TypeError):
+                        pass  # Игнорируем неверные даты
+        
+        if not birthdays:
+            return await message.answer("🤔 В этом году дней рождения не найдено.")
+
+        # Сортируем дни рождения по дате
+        birthdays.sort(key=lambda x: x['date'])
+        
+        # Выбираем 5 ближайших
+        top_5_birthdays = birthdays[:5]
+        
+        message_text = "ABot » Ближайшие дни рождения в этом году:\n\n"
+        
+        for bday in top_5_birthdays:
+            date_str = bday['date'].strftime('%d.%m')
+            message_text += f"{date_str} — {bday['name']}\n"
+            
+        await message.answer(message_text)
+
+    except Exception as e:
+        await message.answer(f"❌ Произошла ошибка при получении дней рождения: {e}")
+
+@labeler.message(text="/top")
+async def top_users_first_page(message: Message):
+    if message.peer_id != TARGET_PEER_ID:
+        return
+    if not check_command_access(message.from_id, 'top'):
+        return await message.answer("❌ У вас нет доступа к этой команде.")
+    await top_users_with_page(message, 1)
+
+@labeler.message(text="/accommand list")
+async def accommand_list(message: Message):
+    if message.peer_id != TARGET_PEER_ID:
+        return
+    if not check_command_access(message.from_id, 'accommand'):
+        return await message.answer("⛔ У вас нет доступа к этой команде.")
+
+    with sqlite3.connect(DB_PATH) as conn:
+        cursor = conn.cursor()
+        cursor.execute("""
+            SELECT command_name, required_level, is_disabled 
+            FROM command_restrictions 
+            ORDER BY required_level ASC, command_name ASC
+        """)
+        commands = cursor.fetchall()
+
+    if not commands:
+        return await message.answer("ABot » Список команд пуст.")
+
+    text = "ABot » Управление доступом к командам:\n\n"
+
+    for cmd, level, disabled in commands:
+        status = "🔴 ОТКЛЮЧЕНА" if disabled else f"🟢 Уровень {level}"
+        text += f"/{cmd} - {status}\n"
+
+    text += "\n💡 Использование:\n"
+    text += "/accommand set <команда> <уровень>\n"
+    text += "/accommand disable <команда>\n"
+    text += "/accommand enable <команда>"
+
+    await message.answer(text)
+
+@labeler.message(text="/accommand set <command> <level:int>")
+async def accommand_set_level(message: Message, command: str, level: int):
+    if message.peer_id != TARGET_PEER_ID:
+        return
+    if not check_command_access(message.from_id, 'accommand'):
+        return await message.answer("⛔ У вас нет доступа к этой команде.")
+
+    if level < 0 or level > 6:
+        return await message.answer("❌ Уровень должен быть от 0 до 6.")
+
+    current_time = get_moscow_time().strftime("%Y-%m-%d %H:%M:%S")
+
+    with sqlite3.connect(DB_PATH) as conn:
+        cursor = conn.cursor()
+        cursor.execute("""
+            INSERT OR REPLACE INTO command_restrictions 
+            (command_name, required_level, is_disabled, modified_by, modified_at)
+            VALUES (?, ?, 0, ?, ?)
+        """, (command, level, message.from_id, current_time))
+        conn.commit()
+
+    await message.answer(f"✅ Команда /{command} теперь требует уровень {level}")
+
+@labeler.message(text="/accommand disable <command>")
+async def accommand_disable(message: Message, command: str):
+    if message.peer_id != TARGET_PEER_ID:
+        return
+    if not check_command_access(message.from_id, 'accommand'):
+        return await message.answer("⛔ У вас нет доступа к этой команде.")
+
+    current_time = get_moscow_time().strftime("%Y-%m-%d %H:%M:%S")
+
+    with sqlite3.connect(DB_PATH) as conn:
+        cursor = conn.cursor()
+        cursor.execute("""
+            INSERT OR REPLACE INTO command_restrictions 
+            (command_name, required_level, is_disabled, modified_by, modified_at)
+            VALUES (?, (SELECT COALESCE(required_level, 0) FROM command_restrictions WHERE command_name = ?), 1, ?, ?)
+        """, (command, command, message.from_id, current_time))
+        conn.commit()
+
+    await message.answer(f"🔴 Команда /{command} отключена")
+
+@labeler.message(text="/accommand enable <command>")
+async def accommand_enable(message: Message, command: str):
+    if message.peer_id != TARGET_PEER_ID:
+        return
+    if not check_command_access(message.from_id, 'accommand'):
+        return await message.answer("⛔ У вас нет доступа к этой команде.")
+
+    current_time = get_moscow_time().strftime("%Y-%m-%d %H:%M:%S")
+
+    with sqlite3.connect(DB_PATH) as conn:
+        cursor = conn.cursor()
+        cursor.execute("""
+            UPDATE command_restrictions 
+            SET is_disabled = 0, modified_by = ?, modified_at = ?
+            WHERE command_name = ?
+        """, (message.from_id, current_time, command))
+
+        if cursor.rowcount == 0:
+            return await message.answer(f"❌ Команда /{command} не найдена в системе ограничений.")
+
+        conn.commit()
+
+    await message.answer(f"🟢 Команда /{command} включена")
+
+@labeler.message(text="/accommand")
+async def accommand_help(message: Message):
+    if message.peer_id != TARGET_PEER_ID:
+        return
+    if not check_command_access(message.from_id, 'accommand'):
+        return await message.answer("⛔ У вас нет доступа к этой команде.")
+
+    await message.answer(
+        "ABot » Управление доступом к командам (уровень 6):\n\n"
+        "📋 Доступные команды:\n"
+        "/accommand list - Список всех команд и их уровней\n"
+        "/accommand set <команда> <уровень> - Установить уровень доступа\n"
+        "/accommand disable <команда> - Отключить команду\n"
+        "/accommand enable <команда> - Включить команду\n\n"
+        "💡 Пример использования:\n"
+        "/accommand set kick 5 - Команда /kick требует 5 уровень\n"
+        "/accommand disable warn - Отключить команду /warn\n"
+        "/accommand enable warn - Включить команду /warn"
+    )
+
+@labeler.message(text="/greetings add <greeting_text>")
+async def greetings_add(message: Message, greeting_text: str):
+    if message.peer_id != TARGET_PEER_ID:
+        return
+    if not check_command_access(message.from_id, 'greetings'):
+        return await message.answer("⛔ У вас нет доступа к этой команде.")
+
+    current_time = get_moscow_time().strftime("%d.%m.%Y %H:%M:%S")
+
+    with sqlite3.connect(DB_PATH) as conn:
+        cursor = conn.cursor()
+        cursor.execute("""
+            INSERT INTO greetings (text, wait_seconds, created_by, created_at)
+            VALUES (?, 0, ?, ?)
+        """, (greeting_text, message.from_id, current_time))
+
+        greeting_id = cursor.lastrowid
+        conn.commit()
+
+    await message.answer(f"✅ Приветствие добавлено с ID {greeting_id}\n📝 Текст: {greeting_text}")
+
+@labeler.message(text="/greetings set <greeting_id:int>")
+async def greetings_set_active(message: Message, greeting_id: int):
+    if message.peer_id != TARGET_PEER_ID:
+        return
+    if not check_command_access(message.from_id, 'greetings'):
+        return await message.answer("⛔ У вас нет доступа к этой команде.")
+
+    with sqlite3.connect(DB_PATH) as conn:
+        cursor = conn.cursor()
+
+        # Проверяем существование приветствия
+        cursor.execute("SELECT text FROM greetings WHERE id = ?", (greeting_id,))
+        greeting = cursor.fetchone()
+
+        if not greeting:
+            return await message.answer(f"❌ Приветствие с ID {greeting_id} не найдено.")
+
+        # Устанавливаем активное приветствие
+        cursor.execute("""
+            INSERT OR REPLACE INTO greeting_settings (key, value)
+            VALUES ('active_greeting_id', ?)
+        """, (str(greeting_id),))
+
+        conn.commit()
+
+    await message.answer(f"✅ Приветствие с ID {greeting_id} установлено как активное\n📝 Текст: {greeting[0]}")
+
+@labeler.message(text="/greetings setwait <greeting_id:int> <wait_seconds:int>")
+async def greetings_set_wait(message: Message, greeting_id: int, wait_seconds: int):
+    if message.peer_id != TARGET_PEER_ID:
+        return
+    if not check_command_access(message.from_id, 'greetings'):
+        return await message.answer("⛔ У вас нет доступа к этой команде.")
+
+    if wait_seconds < 0 or wait_seconds > 300:
+        return await message.answer("❌ Время ожидания должно быть от 0 до 300 секунд.")
+
+    current_time = get_moscow_time().strftime("%d.%m.%Y %H:%M:%S")
+
+    with sqlite3.connect(DB_PATH) as conn:
+        cursor = conn.cursor()
+
+        # Проверяем существование приветствия
+        cursor.execute("SELECT text FROM greetings WHERE id = ?", (greeting_id,))
+        greeting = cursor.fetchone()
+
+        if not greeting:
+            return await message.answer(f"❌ Приветствие с ID {greeting_id} не найдено.")
+
+        # Обновляем время ожидания
+        cursor.execute("""
+            UPDATE greetings SET wait_seconds = ?, modified_by = ?, modified_at = ?
+            WHERE id = ?
+        """, (wait_seconds, message.from_id, current_time, greeting_id))
+
+        conn.commit()
+
+    await message.answer(f"✅ Время ожидания для приветствия {greeting_id} установлено: {wait_seconds} секунд")
+
+@labeler.message(text="/greetings edit <greeting_id:int> <new_text>")
+async def greetings_edit(message: Message, greeting_id: int, new_text: str):
+    if message.peer_id != TARGET_PEER_ID:
+        return
+    if not check_command_access(message.from_id, 'greetings'):
+        return await message.answer("⛔ У вас нет доступа к этой команде.")
+
+    current_time = get_moscow_time().strftime("%d.%m.%Y %H:%M:%S")
+
+    with sqlite3.connect(DB_PATH) as conn:
+        cursor = conn.cursor()
+
+        # Проверяем существование приветствия
+        cursor.execute("SELECT text FROM greetings WHERE id = ?", (greeting_id,))
+        greeting = cursor.fetchone()
+
+        if not greeting:
+            return await message.answer(f"❌ Приветствие с ID {greeting_id} не найдено.")
+
+        # Обновляем текст
+        cursor.execute("""
+            UPDATE greetings SET text = ?, modified_by = ?, modified_at = ?
+            WHERE id = ?
+        """, (new_text, message.from_id, current_time, greeting_id))
+
+        conn.commit()
+
+    await message.answer(f"✅ Приветствие {greeting_id} обновлено\n📝 Новый текст: {new_text}")
+
+@labeler.message(text="/greetings get")
+async def greetings_get_active(message: Message):
+    if message.peer_id != TARGET_PEER_ID:
+        return
+    if not check_command_access(message.from_id, 'greetings'):
+        return await message.answer("⛔ У вас нет доступа к этой команде.")
+
+    with sqlite3.connect(DB_PATH) as conn:
+        cursor = conn.cursor()
+
+        # Получаем активное приветствие
+        cursor.execute("SELECT value FROM greeting_settings WHERE key = 'active_greeting_id'")
+        active_greeting = cursor.fetchone()
+
+        if not active_greeting or not active_greeting[0]:
+            return await message.answer("❌ Активное приветствие не установлено.")
+
+        greeting_id = int(active_greeting[0])
+
+        # Получаем информацию о приветствии
+        cursor.execute("""
+            SELECT text, wait_seconds, created_by, created_at, modified_by, modified_at
+            FROM greetings WHERE id = ?
+        """, (greeting_id,))
+        greeting_data = cursor.fetchone()
+
+        if not greeting_data:
+            return await message.answer("❌ Активное приветствие не найдено в базе данных.")
+
+        text, wait_seconds, created_by, created_at, modified_by, modified_at = greeting_data
+
+        try:
+            creator_info = await bot.api.users.get(user_ids=[created_by])
+            creator_name = f"{creator_info[0].first_name} {creator_info[0].last_name}"
+        except:
+            creator_name = "Неизвестно"
+
+    response = f"ABot » Текущее активное приветствие (ID {greeting_id}):\n\n"
+    response += f"📝 Текст: {text}\n"
+    response += f"⏰ Задержка: {wait_seconds} секунд\n"
+    response += f"👤 Создал: {creator_name}\n"
+    response += f"📅 Создано: {created_at}\n"
+
+    if modified_by and modified_at:
+        try:
+            modifier_info = await bot.api.users.get(user_ids=[modified_by])
+            modifier_name = f"{modifier_info[0].first_name} {modifier_info[0].last_name}"
+        except:
+            modifier_name = "Неизвестно"
+        response += f"✏️ Изменено: [https://vk.com/id{modified_by}|{modifier_name}] ({modified_at})"
+
+    await message.answer(response)
+
+@labeler.message(text="/greetings get <greeting_id:int>")
+async def greetings_get_specific(message: Message, greeting_id: int):
+    if message.peer_id != TARGET_PEER_ID:
+        return
+    if not check_command_access(message.from_id, 'greetings'):
+        return await message.answer("⛔ У вас нет доступа к этой команде.")
+
+    with sqlite3.connect(DB_PATH) as conn:
+        cursor = conn.cursor()
+        cursor.execute("""
+            SELECT text, wait_seconds, created_by, created_at, modified_by, modified_at
+            FROM greetings WHERE id = ?
+        """, (greeting_id,))
+        greeting_data = cursor.fetchone()
+
+        if not greeting_data:
+            return await message.answer(f"❌ Приветствие с ID {greeting_id} не найдено.")
+
+        text, wait_seconds, created_by, created_at, modified_by, modified_at = greeting_data
+
+        try:
+            creator_info = await bot.api.users.get(user_ids=[created_by])
+            creator_name = f"{creator_info[0].first_name} {creator_info[0].last_name}"
+        except:
+            creator_name = "Неизвестно"
+
+    # Проверяем активное ли это приветствие
+    with sqlite3.connect(DB_PATH) as conn:
+        cursor = conn.cursor()
+        cursor.execute("SELECT value FROM greeting_settings WHERE key = 'active_greeting_id'")
+        active_greeting = cursor.fetchone()
+        is_active = active_greeting and active_greeting[0] == str(greeting_id)
+
+    status = "🟢 АКТИВНОЕ" if is_active else "🔴 неактивное"
+
+    response = f"ABot » Информация о приветствии ID {greeting_id} ({status}):\n\n"
+    response += f"📝 Текст: {text}\n"
+    response += f"⏰ Задержка: {wait_seconds} секунд\n"
+    response += f"👤 Создал: {creator_name}\n"
+    response += f"📅 Создано: {created_at}\n"
+
+    if modified_by and modified_at:
+        try:
+            modifier_info = await bot.api.users.get(user_ids=[modified_by])
+            modifier_name = f"{modifier_info[0].first_name} {modifier_info[0].last_name}"
+        except:
+            modifier_name = "Неизвестно"
+        response += f"✏️ Изменено: [https://vk.com/id{modified_by}|{modifier_name}] ({modified_at})"
+
+    await message.answer(response)
+
+@labeler.message(text="/greetings list <page:int>")
+async def greetings_list_with_page(message: Message, page: int):
+    if message.peer_id != TARGET_PEER_ID:
+        return
+    if not check_command_access(message.from_id, 'greetings'):
+        return await message.answer("⛔ У вас нет доступа к этой команде.")
+
+    with sqlite3.connect(DB_PATH) as conn:
+        cursor = conn.cursor()
+        cursor.execute("""
+            SELECT id, text, wait_seconds, created_by, created_at
+            FROM greetings ORDER BY id DESC
+        """)
+        all_greetings = cursor.fetchall()
+
+        # Получаем активное приветствие
+        cursor.execute("SELECT value FROM greeting_settings WHERE key = 'active_greeting_id'")
+        active_greeting = cursor.fetchone()
+        active_id = int(active_greeting[0]) if active_greeting and active_greeting[0] else None
+
+    if not all_greetings:
+        return await message.answer("📝 Список приветствий пуст.")
+
+    per_page = 10
+    total_pages = (len(all_greetings) + per_page - 1) // per_page
+
+    if page < 1 or page > total_pages:
+        return await message.answer(f"❌ Страница {page} не найдена. Доступно страниц: {total_pages}")
+
+    start = (page - 1) * per_page
+    greetings_slice = all_greetings[start:start + per_page]
+
+    text = f"ABot » Список приветствий (страница {page}/{total_pages}):\n\n"
+
+    for greeting_id, greeting_text, wait_seconds, created_by, created_at in greetings_slice:
+        status = "🟢" if greeting_id == active_id else "🔴"
+
+        # Ограничиваем длину текста для списка
+        short_text = greeting_text[:50] + "..." if len(greeting_text) > 50 else greeting_text
+
+        try:
+            creator_info = await bot.api.users.get(user_ids=[created_by])
+            creator_name = f"{creator_info[0].first_name} {creator_info[0].last_name}"
+        except:
+            creator_name = "Неизвестно"
+
+        text += f"{status} ID {greeting_id}: {short_text}\n"
+        text += f"   ⏰ {wait_seconds}с | 👤 {creator_name} | 📅 {created_at}\n\n"
+
+    await message.answer(text)
+
+@labeler.message(text="/greetings list")
+async def greetings_list_first_page(message: Message):
+    await greetings_list_with_page(message, 1)
+
+@labeler.message(text="/greetings")
+async def greetings_help(message: Message):
+    if message.peer_id != TARGET_PEER_ID:
+        return
+    if not check_command_access(message.from_id, 'greetings'):
+        return await message.answer("⛔ У вас нет доступа к этой команде.")
+
+    await message.answer(
+        "ABot » Список доступных команд:\n\n"
+        "/greetings add <Текст> - Добавить приветствие\n"
+        "/greetings set <ID приветствия> - Установить приветствие\n"
+        "/greetings setwait <ID приветствия> <Кол-во секунд> - Время ожидания\n"
+        "/greetings edit <ID приветствия> <Текст> - Изменить текст\n"
+        "/greetings get - Вывести текущее приветствие\n"
+        "/greetings get <ID приветствия> - Вывести информацию о приветствии\n"
+        "/greetings list <Страница> - Список приветствий\n\n"
+        "💡 Переменные в тексте приветствия:\n"
+        "{name} - имя пользователя\n"
+        "{id} - ID пользователя\n\n"
+        "⏰ Время ожидания: от 0 до 300 секунд"
+    )
+
+# 🚫 СИСТЕМНЫЙ БАН - ПОЛНАЯ БЛОКИРОВКА ПОЛЬЗОВАТЕЛЯ
+@labeler.message(text="/ban <user_arg> <reason>")
+async def ban_user_with_reason(message: Message, user_arg: str, reason: str):
+    if message.peer_id != TARGET_PEER_ID:
+        return
+    if not check_command_access(message.from_id, 'ban'):
+        return await message.answer("⛔ У вас нет доступа к этой команде.")
+
+    user_level = get_admin_level(message.from_id)
+    id_vk = await extract_user_id(user_arg)
+
+    if not id_vk:
+        return await message.answer(
+            "❌ Не удалось определить ID пользователя.\n\n"
+            "📝 Использование команды:\n"
+            "/ban <Пользователь> <Причина>\n\n"
+            "💡 Пример:\n"
+            "/ban @id123456789 сжшник"
+        )
+
+    target_level = get_admin_level(id_vk)
+    if target_level >= user_level:
+        return await message.answer("⛔ Вы не можете заблокировать пользователя с уровнем равным или выше вашего.")
+
+    current_time = get_moscow_time().strftime("%d.%m.%Y %H:%M:%S")
+
+    with sqlite3.connect(DB_PATH) as conn:
+        cursor = conn.cursor()
+
+        # Проверяем, не заблокирован ли пользователь уже
+        cursor.execute("SELECT banned_at FROM blacklisted_users WHERE user_id = ?", (id_vk,))
+        is_blocked = cursor.fetchone()
+
+        if is_blocked:
+            return await message.answer(f"❌ Пользователь с ID {id_vk} уже заблокирован.")
+
+        # Добавляем в чёрный список
+        cursor.execute("""
+            INSERT INTO blacklisted_users (user_id, banned_at, banned_by, reason)
+            VALUES (?, ?, ?, ?)
+        """, (id_vk, current_time, message.from_id, reason))
+
+        # Обновляем предупреждения и выговоры
+        cursor.execute("UPDATE warnings SET warns_count = 0, kicks_count = 0 WHERE user_id = ?", (id_vk,))
+
+        # Записываем в историю блокировки
+        cursor.execute("""
+            INSERT INTO warning_history (user_id, action_type, warns_change, kicks_change, reason, issued_by, issued_at)
+            VALUES (?, 'ban', 0, 0, ?, ?, ?)
+        """, (id_vk, reason, message.from_id, current_time))
+
+        conn.commit()
+
+    try:
+        user_info = await bot.api.users.get(user_ids=[id_vk])
+        name = f"{user_info[0].first_name} {user_info[0].last_name}"
+    except:
+        name = "Неизвестно"
+
+    await message.answer(f"🚫 Пользователь [https://vk.com/id{id_vk}|{name}] заблокирован!\n📝 Причина: {reason}")
+
+@labeler.message(text="/ban <user_arg>")
+async def ban_user_no_reason(message: Message, user_arg: str):
+    await ban_user_with_reason(message, user_arg, "не указана")
+
+@labeler.message(text="/ban")
+async def ban_help(message: Message):
+    if message.peer_id != TARGET_PEER_ID:
+        return
+    if not check_command_access(message.from_id, 'ban'):
+        return await message.answer("⛔ У вас нет доступа к этой команде.")
+
+    await message.answer(
+        "ABot » Использование команды /ban:\n\n"
+        "/ban <Пользователь> <Причина>\n\n"
+        "💡 Пример использования:\n"
+        "/ban @id123456789 Нарушение правил\n"
+        "/ban 123456789 сжшник\n"
+        "/ban https://vk.com/id123456789 Спам"
+    )
+
+
+async def on_startup():
+    """Функция, выполняемая при запуске бота"""
+    print("🤖 Бот запущен!")
+    global current_chat_peer_id
+    current_chat_peer_id = TARGET_PEER_ID
+
+    # Выполняем одноразовый сброс времени для участников беседы
+    await one_time_reset_chat_users()
+
+    # Синхронизируем участников беседы
+    await sync_chat_members()
+
+# Обработчик событий реакций для МГНОВЕННОЙ блокировки реакций заглушенных пользователей
+@bot.on.raw_event("message_reaction_event") 
+async def handle_reaction_event(event):
+    try:
+        # Получаем данные из event
+        event_data = event.object if hasattr(event, 'object') else event
+
+        peer_id = event_data.get('peer_id')
+        if peer_id != TARGET_PEER_ID:
+            return
+
+        user_id = event_data.get('user_id')
+        if not user_id:
+            return
+
+        # МГНОВЕННАЯ проверка мута
+        if is_user_muted(user_id):
+            reaction_id = event_data.get('reaction_id')
+            cmid = event_data.get('cmid')
+
+            if reaction_id and cmid:
+                # Удаляем реакцию БЕЗ задержек
+                await bot.api.messages.delete_reaction(
+                    peer_id=TARGET_PEER_ID,
+                    cmid=cmid,
+                    reaction_id=reaction_id
+                )
+                print(f"🚫 БЛОКИРОВКА: удалена реакция от заглушенного пользователя {user_id}")
+
+    except Exception as e:
+        print(f"❌ Ошибка блокировки реакции: {e}")
+
+# 🚫 СИСТЕМНЫЙ МУТ - ПОЛНАЯ БЛОКИРОВКА ОБЩЕНИЯ
+async def system_mute_check(message: Message) -> bool:
+    """
+    СИСТЕМНЫЙ МУТ - мгновенно блокирует ВСЁ общение заглушенных пользователей
+    Возвращает True если пользователь заглушен и его сообщение удалено
+    """
+    # Быстрая проверка мута
+    if not is_user_muted(message.from_id):
+        return False
+
+    # МГНОВЕННОЕ удаление сообщения заглушенного пользователя
+    try:
+        await bot.api.messages.delete(
+            cmids=[message.conversation_message_id],
+            peer_id=message.peer_id,
+            delete_for_all=True
+        )
+        print(f"🚫 СИСТЕМНЫЙ МУТ: заблокировано сообщение от пользователя {message.from_id}")
+
+        # Единоразовое уведомление о блокировке
+        if message.from_id not in mute_notifications_sent:
+            await send_mute_notification(message.from_id)
+
+        return True
+    except Exception as e:
+        print(f"❌ Ошибка системного мута для пользователя {message.from_id}: {e}")
+        return True
+
+async def send_mute_notification(user_id: int):
+    """Отправить уведомление о блокировке общения"""
+    try:
+        with sqlite3.connect(DB_PATH) as conn:
+            cursor = conn.cursor()
+            cursor.execute("SELECT reason, muted_until FROM muted_users WHERE user_id = ?", (user_id,))
+            mute_info = cursor.fetchone()
+
+            if mute_info:
+                reason, muted_until = mute_info
+                if muted_until and muted_until != '':
+                    try:
+                        until_dt = datetime.strptime(muted_until, "%Y-%m-%d %H:%M:%S")
+                        until_display = until_dt.strftime("%d.%m.%Y %H:%M")
+                        duration_text = f"до {until_display}"
+                    except:
+                        duration_text = "навсегда"
+                else:
+                    duration_text = "навсегда"
+
+                import random
+                try:
+                    await bot.api.messages.send(
+                        peer_id=user_id,
+                        message=f"🚫 СИСТЕМНАЯ БЛОКИРОВКА ОБЩЕНИЯ\n\n⏰ Действует {duration_text}\n📝 Причина: {reason}\n\n❌ ВЫ НЕ МОЖЕТЕ ОБЩАТЬСЯ В БЕСЕДЕ!\n🚫 Все сообщения и реакции блокируются мгновенно\n🔄 Бот автоматически удаляет любые ваши действия\n\n💡 Для разблокировки обратитесь к администрации",
+                        random_id=random.randint(1, 2**31)
+                    )
+                    print(f"📩 Уведомление о блокировке отправлено пользователю {user_id}")
+                    mute_notifications_sent.add(user_id)
+                except Exception as ls_error:
+                    if "cannot start a conversation" in str(ls_error).lower() or "without permission" in str(ls_error).lower():
+                        print(f"ℹ️ Пользователь {user_id} заблокировал ЛС от ботов")
+                        mute_notifications_sent.add(user_id)
+                    else:
+                        print(f"❌ Не удалось отправить уведомление пользователю {user_id}: {ls_error}")
+    except Exception as e:
+        print(f"❌ Ошибка при уведомлении пользователя {user_id}: {e}")
+
+def is_user_muted(user_id: int) -> bool:
+    """Проверить, заглушен ли пользователь"""
+    try:
+        current_time = get_moscow_time()
+        with sqlite3.connect(DB_PATH) as conn:
+            cursor = conn.cursor()
+            cursor.execute("SELECT muted_until FROM muted_users WHERE user_id = ?", (user_id,))
+            result = cursor.fetchone()
+
+            if result:
+                muted_until_str = result[0]
+                if muted_until_str and muted_until_str != '':
+                    muted_until_dt = datetime.strptime(muted_until_str, "%Y-%m-%d %H:%M:%S")
+                    muted_until_dt = muted_until_dt.replace(tzinfo=MSK_TZ)
+                    if current_time > muted_until_dt:
+                        # Заглушка истекла, удаляем
+                        cursor.execute("DELETE FROM muted_users WHERE user_id = ?", (user_id,))
+                        conn.commit()
+                        return False
+                    else:
+                        return True # Заглушка активна
+                else:
+                    return True # Заглушка навсегда
+            else:
+                return False # Пользователь не заглушен
+    except Exception as e:
+        print(f"❌ Ошибка при проверке заглушки пользователя {user_id}: {e}")
+        return False # В случае ошибки считаем, что не заглушен
+
+
+# Обработчик всех сообщений для автоматического трекинга (должен быть ПОСЛЕДНИМ!)
+@labeler.message()
+async def track_all_messages_final(message: Message):
+    global current_chat_peer_id
+
+    # Устанавливаем peer_id при первом сообщении
+    if not current_chat_peer_id:
+        current_chat_peer_id = message.peer_id
+        print(f"🔗 Установлен peer_id беседы: {current_chat_peer_id}")
+        await sync_chat_members()
+
+    # Проверяем только сообщения из целевой беседы
+    if message.peer_id != TARGET_PEER_ID:
+        return
+
+    # СИСТЕМНЫЙ МУТ - блокировка сообщений заглушенных пользователей
+    if await system_mute_check(message):
+        return  # Сообщение заблокировано, дальше не обрабатываем
+
+    # Отслеживаем изменения участников
+    await auto_track_member_changes(message)
+
+    # Обновляем данные пользователя
+    await get_user_data(message.from_id)
+
+    # Увеличиваем счётчик сообщений
+    update_message_count(message.from_id)
+
+    # Периодическая проверка заблокированных пользователей (каждое 10-е сообщение)
+    import random
+    if random.randint(1, 10) == 1:
+        await sync_chat_members()
 
 if __name__ == "__main__":
-    main()
+    init_db()
+    bot.labeler.load(labeler)
+
+    # Добавляем задачи запуска
+    bot.loop_wrapper.on_startup.append(on_startup())
+
+    bot.run_forever()

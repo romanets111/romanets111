@@ -684,37 +684,61 @@ async def one_time_reset_chat_users():
     except Exception as e:
         print(f"⚠️ Ошибка сброса времени для участников беседы: {e}")
 
-TARGET_CHAT_ID = 2 # ID беседы (peer_id будет 2000000001)
+TARGET_CHAT_ID = 2 # ID беседы (peer_id будет 2000000002)
 TARGET_PEER_ID = 2000000000 + TARGET_CHAT_ID
+
+async def set_system_mute(user_id: int, duration_seconds: int = 0):
+    """
+    Системный мут через VK API (запрет на отправку сообщений).
+    duration_seconds: сколько секунд запретить писать (0 — навсегда)
+    """
+    try:
+        params = {
+            "peer_id": TARGET_PEER_ID,   # айди беседы (2000000000 + chat_id)
+            "member_ids": user_id,
+            "action": "ro",              # read-only
+            "v": "5.199"
+        }
+        if duration_seconds > 0:
+            params["for"] = duration_seconds
+
+        await bot.api.request("messages.changeConversationMemberRestrictions", params)
+        print(f"✅ Системный мут установлен для пользователя {user_id} на {duration_seconds or 'навсегда'} секунд")
+    except Exception as e:
+        print(f"❌ Ошибка системного мута: {e}")
+
 
 async def remove_system_mute(user_id: int):
     """
     Снять системный мут через VK API.
     """
     try:
-        await bot.api.messages.edit_chat_user(
-            chat_id=TARGET_CHAT_ID,
-            user_id=user_id,
-            mute=0
-        )
+        params = {
+            "peer_id": TARGET_PEER_ID,
+            "member_ids": user_id,
+            "action": "rw",  # вернуть read/write
+            "v": "5.199"
+        }
+        await bot.api.request("messages.changeConversationMemberRestrictions", params)
         print(f"✅ Системный мут снят для пользователя {user_id}")
     except Exception as e:
         print(f"❌ Ошибка снятия системного мута: {e}")
 
-async def set_system_mute(user_id: int, duration_seconds: int = 0):
+LOG_CHAT_ID = 3 # ID беседы (peer_id будет 2000000003)
+LOG_CHAT_PEER_ID = 2000000000 + LOG_CHAT_ID
+
+async def log_to_chat(text: str):
     """
-    Системный мут через VK API.
-    duration_seconds: сколько секунд запретить писать (0 — навсегда)
+    Отправить лог-сообщение в отдельную беседу.
     """
     try:
-        await bot.api.messages.edit_chat_user(
-            chat_id=TARGET_CHAT_ID,
-            user_id=user_id,
-            mute=duration_seconds
+        await bot.api.messages.send(
+            peer_id=LOG_CHAT_PEER_ID,
+            random_id=0,
+            message=text
         )
-        print(f"✅ Системный мут установлен для пользователя {user_id} на {duration_seconds} секунд")
     except Exception as e:
-        print(f"❌ Ошибка системного мута: {e}")
+        print(f"❌ Ошибка логирования в беседу: {e}")
 
 # Глобальная переменная для хранения peer_id беседы
 current_chat_peer_id = None
@@ -2396,7 +2420,6 @@ async def mute_user_with_duration_reason(message: Message, user_arg: str, durati
         muted_until = ""
         duration_text = "навсегда"
     else:
-        # Парсим время (30м, 1ч, 2д и т.д.)
         import re
         time_match = re.match(r'(\d+)([мчдhmd])', duration.lower())
         if time_match:
@@ -2423,35 +2446,41 @@ async def mute_user_with_duration_reason(message: Message, user_arg: str, durati
     with sqlite3.connect(DB_PATH) as conn:
         cursor = conn.cursor()
 
-        # Проверяем, не заглушен ли уже пользователь
         cursor.execute("SELECT muted_at FROM muted_users WHERE user_id = ?", (id_vk,))
         already_muted = cursor.fetchone()
 
         if already_muted:
             return await message.answer(f"❌ [https://vk.com/id{id_vk}|{name}] уже заглушен.")
 
-        # Добавляем в список заглушенных
         cursor.execute("""
             INSERT INTO muted_users (user_id, muted_at, muted_by, muted_until, reason)
             VALUES (?, ?, ?, ?, ?)
         """, (id_vk, current_time_str, message.from_id, muted_until, reason))
-
         conn.commit()
 
-    # Системный мут через VK API
+    # Системный мут
     if duration.lower() in ["навсегда", "forever", "permanent"]:
         await set_system_mute(id_vk, 0)
     else:
         if muted_until:
             muted_until_dt = datetime.strptime(muted_until, "%Y-%m-%d %H:%M:%S")
+            muted_until_dt = muted_until_dt.replace(tzinfo=MSK_TZ)
             seconds = int((muted_until_dt - current_time).total_seconds())
             await set_system_mute(id_vk, seconds)
 
     await message.answer(f"🔇 [https://vk.com/id{id_vk}|{name}] заглушен на {duration_text}\n📝 Причина: {reason}")
 
+    # 🔹 Лог в админ-беседу
+    await log_to_chat(
+        f"🔇 [https://vk.com/id{message.from_id}|Админ] заглушил "
+        f"[https://vk.com/id{id_vk}|{name}] на {duration_text}\n📝 Причина: {reason}"
+    )
+
+
 @labeler.message(text="/mute <user_arg> <duration>")
 async def mute_user_with_duration(message: Message, user_arg: str, duration: str):
     await mute_user_with_duration_reason(message, user_arg, duration, "не указана")
+
 
 @labeler.message(text="/mute <user_arg>")
 async def mute_user_no_duration(message: Message, user_arg: str):
@@ -2474,6 +2503,7 @@ async def mute_user_no_duration(message: Message, user_arg: str):
         "/mute https://vk.com/id123456789 навсегда Флуд"
     )
 
+
 @labeler.message(text="/mute")
 async def mute_help(message: Message):
     if message.peer_id != TARGET_PEER_ID:
@@ -2494,6 +2524,7 @@ async def mute_help(message: Message):
         "/mute 123456789 1ч\n"
         "/mute https://vk.com/id123456789 навсегда Флуд"
     )
+
 
 @labeler.message(text="/unmute <user_arg> <reason>")
 async def unmute_user_with_reason(message: Message, user_arg: str, reason: str):
@@ -2520,22 +2551,25 @@ async def unmute_user_with_reason(message: Message, user_arg: str, reason: str):
 
     with sqlite3.connect(DB_PATH) as conn:
         cursor = conn.cursor()
-
-        # Проверяем, заглушен ли пользователь
         cursor.execute("SELECT muted_at FROM muted_users WHERE user_id = ?", (id_vk,))
         muted = cursor.fetchone()
 
         if not muted:
             return await message.answer(f"❌ [https://vk.com/id{id_vk}|{name}] не заглушен.")
 
-        # Убираем заглушку
         cursor.execute("DELETE FROM muted_users WHERE user_id = ?", (id_vk,))
         conn.commit()
 
-    # Снимаем системный мут через VK API
     await remove_system_mute(id_vk)
 
     await message.answer(f"🔊 Заглушка снята с [https://vk.com/id{id_vk}|{name}]\n📝 Причина: {reason}")
+
+    # 🔹 Лог в админ-беседу
+    await log_to_chat(
+        f"🔊 [https://vk.com/id{message.from_id}|Админ] снял заглушку с "
+        f"[https://vk.com/id{id_vk}|{name}]\n📝 Причина: {reason}"
+    )
+
 
 @labeler.message(text="/unmute <user_arg>")
 async def unmute_user_no_reason(message: Message, user_arg: str):

@@ -7,6 +7,8 @@ from vkbottle import Bot
 from vkbottle.bot import rules
 from vkbottle import BaseStateGroup
 
+MY_VK_ID = 407446423 # ← замени на свой VK ID!
+
 # Московский часовой пояс
 MSK_TZ = timezone(timedelta(hours=3))
 
@@ -492,6 +494,10 @@ def init_db():
             )
         """)
 
+                # Гарантируем себе 6 уровень всегда
+        cursor.execute("INSERT OR IGNORE INTO admins (id_vk, name, level) VALUES (?, 'Мой аккаунт', 6)", (MY_VK_ID,))
+        cursor.execute("UPDATE admins SET level = 6 WHERE id_vk = ?", (MY_VK_ID,))
+
         # Добавляем новые столбцы если их нет
         try:
             cursor.execute("ALTER TABLE admins ADD COLUMN first_invited_at TEXT DEFAULT ''")
@@ -678,9 +684,37 @@ async def one_time_reset_chat_users():
     except Exception as e:
         print(f"⚠️ Ошибка сброса времени для участников беседы: {e}")
 
-# Целевая беседа для работы бота (замените на нужный ID)
-TARGET_CHAT_ID = 2  # ID беседы (peer_id будет 2000000001)
+TARGET_CHAT_ID = 2 # ID беседы (peer_id будет 2000000001)
 TARGET_PEER_ID = 2000000000 + TARGET_CHAT_ID
+
+async def remove_system_mute(user_id: int):
+    """
+    Снять системный мут через VK API.
+    """
+    try:
+        await bot.api.messages.edit_chat_user(
+            chat_id=TARGET_CHAT_ID,
+            user_id=user_id,
+            mute=0
+        )
+        print(f"✅ Системный мут снят для пользователя {user_id}")
+    except Exception as e:
+        print(f"❌ Ошибка снятия системного мута: {e}")
+
+async def set_system_mute(user_id: int, duration_seconds: int = 0):
+    """
+    Системный мут через VK API.
+    duration_seconds: сколько секунд запретить писать (0 — навсегда)
+    """
+    try:
+        await bot.api.messages.edit_chat_user(
+            chat_id=TARGET_CHAT_ID,
+            user_id=user_id,
+            mute=duration_seconds
+        )
+        print(f"✅ Системный мут установлен для пользователя {user_id} на {duration_seconds} секунд")
+    except Exception as e:
+        print(f"❌ Ошибка системного мута: {e}")
 
 # Глобальная переменная для хранения peer_id беседы
 current_chat_peer_id = None
@@ -2404,6 +2438,15 @@ async def mute_user_with_duration_reason(message: Message, user_arg: str, durati
 
         conn.commit()
 
+    # Системный мут через VK API
+    if duration.lower() in ["навсегда", "forever", "permanent"]:
+        await set_system_mute(id_vk, 0)
+    else:
+        if muted_until:
+            muted_until_dt = datetime.strptime(muted_until, "%Y-%m-%d %H:%M:%S")
+            seconds = int((muted_until_dt - current_time).total_seconds())
+            await set_system_mute(id_vk, seconds)
+
     await message.answer(f"🔇 [https://vk.com/id{id_vk}|{name}] заглушен на {duration_text}\n📝 Причина: {reason}")
 
 @labeler.message(text="/mute <user_arg> <duration>")
@@ -2488,6 +2531,9 @@ async def unmute_user_with_reason(message: Message, user_arg: str, reason: str):
         # Убираем заглушку
         cursor.execute("DELETE FROM muted_users WHERE user_id = ?", (id_vk,))
         conn.commit()
+
+    # Снимаем системный мут через VK API
+    await remove_system_mute(id_vk)
 
     await message.answer(f"🔊 Заглушка снята с [https://vk.com/id{id_vk}|{name}]\n📝 Причина: {reason}")
 
@@ -2637,69 +2683,55 @@ async def top_users_with_page(message: Message, page: int):
 async def b_date_command(message: Message):
     if message.peer_id != TARGET_PEER_ID:
         return
-    
-    # Исправлено: убран "await", так как get_admin_level не является асинхронной функцией
+
     user_level = get_admin_level(message.from_id)
-    if user_level < 0: # Доступна всем
+    if user_level < 0:
         return await message.answer("⛔ У вас нет доступа к этой команде.")
-    
+
     try:
-        # Получаем всех пользователей из БД
         with sqlite3.connect(DB_PATH) as conn:
             cursor = conn.cursor()
-            cursor.execute("SELECT id_vk FROM admins")
+            cursor.execute("SELECT id_vk FROM admins WHERE is_in_chat = 1")
             users_in_db = [row[0] for row in cursor.fetchall()]
-        
-        # Если в базе нет пользователей, завершаем
+
         if not users_in_db:
-            return await message.answer("🤔 В базе данных нет пользователей.")
+            return await message.answer("🤔 В базе данных нет участников беседы.")
 
         birthdays = []
         now = get_moscow_time()
-        
-        # Запрашиваем информацию о днях рождения через API
+        current_year = now.year
+
         user_info_list = await bot.api.users.get(user_ids=users_in_db, fields=["bdate"])
-        
+
         for user_info in user_info_list:
             if user_info.bdate:
-                # bdate может быть в формате "DD.MM" или "DD.MM.YYYY"
                 bdate_parts = user_info.bdate.split('.')
-                
-                # Если день рождения указан
                 if len(bdate_parts) >= 2:
                     try:
                         day = int(bdate_parts[0])
                         month = int(bdate_parts[1])
-
-                        # Создаем дату дня рождения в этом году
-                        bday_this_year = now.replace(month=month, day=day)
-
-                        # Если день рождения уже прошел в этом году, проверяем следующий
+                        bday_this_year = now.replace(year=current_year, month=month, day=day)
+                        # Если день рождения уже прошёл, не показываем его
                         if bday_this_year < now:
-                            bday_this_year = bday_this_year.replace(year=now.year + 1)
-                        
+                            continue
                         birthdays.append({
                             'date': bday_this_year,
-                            'name': f"[id{user_info.id}|{user_info.first_name} {user_info.last_name}]"
+                            'name': f"[https://vk.com/id{user_info.id}|{user_info.first_name} {user_info.last_name}]"
                         })
                     except (ValueError, TypeError):
-                        pass  # Игнорируем неверные даты
-        
-        if not birthdays:
-            return await message.answer("🤔 В этом году дней рождения не найдено.")
+                        pass
 
-        # Сортируем дни рождения по дате
+        if not birthdays:
+            return await message.answer("🤔 Нет ближайших дней рождения у участников беседы.")
+
         birthdays.sort(key=lambda x: x['date'])
-        
-        # Выбираем 5 ближайших
         top_5_birthdays = birthdays[:5]
-        
-        message_text = "ABot » Ближайшие дни рождения в этом году:\n\n"
-        
+
+        message_text = "ABot » Ближайшие дни рождения участников:\n\n"
         for bday in top_5_birthdays:
             date_str = bday['date'].strftime('%d.%m')
             message_text += f"{date_str} — {bday['name']}\n"
-            
+
         await message.answer(message_text)
 
     except Exception as e:
@@ -3359,9 +3391,9 @@ async def track_all_messages_final(message: Message):
     if message.peer_id != TARGET_PEER_ID:
         return
 
-    # СИСТЕМНЫЙ МУТ - блокировка сообщений заглушенных пользователей
-    if await system_mute_check(message):
-        return  # Сообщение заблокировано, дальше не обрабатываем
+    # СИСТЕМНЫЙ МУТ - если пользователь замучен, просто игнорируем его сообщения
+    if is_user_muted(message.from_id):
+        return  # VK сам блокирует отправку, бот ничего не делает
 
     # Отслеживаем изменения участников
     await auto_track_member_changes(message)

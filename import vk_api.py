@@ -75,10 +75,14 @@ async def extract_user_id(text: str) -> int:
 
     return None
 
-def get_admin_level(user_id: int) -> int:
+def get_admin_level(user_id: int, chat_id: int) -> int:
+    """Получаем уровень админа конкретной конференции"""
     with sqlite3.connect(DB_PATH) as conn:
         cursor = conn.cursor()
-        cursor.execute("SELECT level FROM admins WHERE id_vk = ?", (user_id,))
+        cursor.execute(
+            "SELECT level FROM admins WHERE id_vk = ? AND server = ?", 
+            (user_id, chat_id)
+        )
         result = cursor.fetchone()
         return result[0] if result else 0
 

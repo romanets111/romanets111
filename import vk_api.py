@@ -1980,7 +1980,6 @@ async def unwarn_user_with_reason(message: Message, user_arg: str, warns_count: 
         return
     if not check_command_access(message.from_id, 'unwarn'):
         return await message.answer("⛔ У вас нет доступа к этой команде.")
-    user_level = get_admin_level(message.from_id)
 
     if warns_count <= 0:
         return await message.answer("❌ Количество предупреждений должно быть больше 0.")
@@ -1995,65 +1994,90 @@ async def unwarn_user_with_reason(message: Message, user_arg: str, warns_count: 
             "/unwarn @id123456789 1 Ошибочно выдан"
         )
 
+    # Получаем имя для красивой ссылки
     try:
         user_info = await bot.api.users.get(user_ids=[id_vk])
         name = f"{user_info[0].first_name} {user_info[0].last_name}"
     except:
         name = "Неизвестно"
+    user_link = f"[https://vk.com/id{id_vk}|{name}]"
 
     current_time = get_moscow_time().strftime("%d.%m.%Y %H:%M:%S")
 
     with sqlite3.connect(DB_PATH) as conn:
         cursor = conn.cursor()
 
-        # Получаем текущие предупреждения
+        # Получаем текущее состояние
         cursor.execute("SELECT warns_count, kicks_count FROM warnings WHERE user_id = ?", (id_vk,))
-        result = cursor.fetchone()
+        row = cursor.fetchone()
 
-        if not result:
-            return await message.answer(f"❌ У [https://vk.com/id{id_vk}|{name}] нет предупреждений.")
+        if not row:
+            return await message.answer(f"❌ У {user_link} нет предупреждений.")
 
-        old_warns, old_kicks = result
+        old_warns, old_kicks = row
 
         if old_warns == 0 and old_kicks == 0:
-            return await message.answer(f"❌ У [https://vk.com/id{id_vk}|{name}] нет предупреждений для снятия.")
+            return await message.answer(f"❌ У {user_link} нет предупреждений для снятия.")
 
-        # Рассчитываем сколько предупреждений снять
-        total_warns_to_remove = warns_count
-        current_warns = old_warns
-        current_kicks = old_kicks
+        # Сколько хотим снять
+        to_remove = warns_count
+        current_warns = int(old_warns)
+        current_kicks = int(old_kicks)
 
-        # Сначала снимаем текущие предупреждения
-        if current_warns > 0:
-            warns_removed = min(current_warns, total_warns_to_remove)
-            current_warns -= warns_removed
-            total_warns_to_remove -= warns_removed
+        # 1) Снимаем из текущих предупреждений
+        removed_from_warns = min(current_warns, to_remove)
+        current_warns -= removed_from_warns
+        to_remove -= removed_from_warns
 
-        # Если ещё остались предупреждения для снятия, переводим выговоры в предупреждения
-        if total_warns_to_remove > 0 and current_kicks > 0:
-            kicks_to_convert = min(current_kicks, (total_warns_to_remove + 1) // 2)
-            current_kicks -= kicks_to_convert
-            # Каждый выговор = 2 предупреждения, но мы их снимаем
-            warnings_from_kicks = kicks_to_convert * 2
-            actual_removed = min(warnings_from_kicks, total_warns_to_remove)
-            current_warns = actual_removed # Просто добавляем снятые предупреждения
+        # 2) Если ещё осталось снять — конвертируем выговоры в 2 предупреждения
+        removed_kicks = 0
+        if to_remove > 0 and current_kicks > 0:
+            kicks_needed = (to_remove + 1) // 2  # ceil(to_remove / 2)
+            removed_kicks = min(current_kicks, kicks_needed)
+            current_kicks -= removed_kicks
+            to_remove -= removed_kicks * 2  # каждый выговор покрывает 2 предупреждения
 
-        # Обновляем предупреждения
-        cursor.execute("UPDATE warnings SET warns_count = ?, kicks_count = ? WHERE user_id = ?", (current_warns, current_kicks, id_vk))
+        # Нельзя уходить в минус
+        if current_warns < 0:
+            current_warns = 0
+        if current_kicks < 0:
+            current_kicks = 0
 
-        # Записываем в историю
+        # Фактически снято предупреждений (могут просить больше, чем есть)
+        actually_removed_warns = warns_count - max(0, to_remove)
+
+        # Обновляем БД
+        cursor.execute(
+            "UPDATE warnings SET warns_count = ?, kicks_count = ? WHERE user_id = ?",
+            (current_warns, current_kicks, id_vk)
+        )
+
+        # Пишем в историю: warns_change отрицательное; kicks_change тоже отрицательное, если выговоры конвертировались
         cursor.execute("""
             INSERT INTO warning_history (user_id, action_type, warns_change, kicks_change, reason, issued_by, issued_at)
-            VALUES (?, 'unwarn', ?, 0, ?, ?, ?)
-        """, (id_vk, -warns_count, reason, message.from_id, current_time))
+            VALUES (?, 'unwarn', ?, ?, ?, ?, ?)
+        """, (id_vk, -actually_removed_warns, -removed_kicks, reason, message.from_id, current_time))
 
         conn.commit()
 
-        await message.answer(f"✅ У [https://vk.com/id{id_vk}|{name}] снято {warns_count} предупреждение(й)\n📝 Причина: {reason}\n\n📊 Текущие показатели: выг: {current_kicks}/3, пред: {current_warns}/2")
+    # Текст ответа: показываем, сколько реально сняли
+    if actually_removed_warns <= 0:
+        return await message.answer(f"ℹ️ У {user_link} не нашлось столько предупреждений для снятия.\n"
+                                    f"📊 Текущие показатели: выг: {current_kicks}/3, пред: {current_warns}/2")
+
+    extra = f" (с конвертацией {removed_kicks} выговора/выговоров)" if removed_kicks > 0 else ""
+    await message.answer(
+        f"✅ У {user_link} снято {actually_removed_warns} предупреждение(й){extra}\n"
+        f"📝 Причина: {reason}\n\n"
+        f"📊 Текущие показатели: выг: {current_kicks}/3, пред: {current_warns}/2"
+    )
+
 
 @labeler.message(text="/unwarn <user_arg> <warns_count:int>")
 async def unwarn_user_no_reason(message: Message, user_arg: str, warns_count: int):
+    # По умолчанию причина «не указана»
     await unwarn_user_with_reason(message, user_arg, warns_count, "не указана")
+
 
 @labeler.message(text="/unwarn")
 async def unwarn_help(message: Message):

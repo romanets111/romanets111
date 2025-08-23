@@ -26,7 +26,69 @@ def ensure_chat_exists(peer_id: int, title: str = "Без названия"):
         )
         conn.commit()
 
-# Проверяем токен
+# -------------------- ИНИЦИАЛИЗАЦИЯ БАЗЫ --------------------
+DB_PATH = "admins.db"
+
+def init_db():
+    with sqlite3.connect(DB_PATH) as conn:
+        cursor = conn.cursor()
+
+        # Таблица админов с chat_id
+        cursor.execute("""
+            CREATE TABLE IF NOT EXISTS admins (
+                id_vk INTEGER,
+                chat_id INTEGER DEFAULT 0,
+                name TEXT NOT NULL,
+                level INTEGER NOT NULL,
+                server INTEGER DEFAULT 1,
+                domains TEXT DEFAULT '',
+                position TEXT DEFAULT '',
+                invited_at TEXT DEFAULT '',
+                first_invited_at TEXT DEFAULT '',
+                msg_count INTEGER DEFAULT 0,
+                is_in_chat INTEGER DEFAULT 1,
+                total_time_seconds REAL DEFAULT 0,
+                session_start TEXT DEFAULT '',
+                PRIMARY KEY(id_vk, chat_id)
+            )
+        """)
+
+        # Вставляем себя как админа
+        MY_CHAT_ID = 2000000002  # ID беседы, где ты админ
+        cursor.execute("""
+            INSERT OR IGNORE INTO admins (id_vk, chat_id, name, level)
+            VALUES (?, ?, 'Мой аккаунт', 6)
+        """, (MY_VK_ID, MY_CHAT_ID))
+        cursor.execute("""
+            UPDATE admins SET level = 6 WHERE id_vk = ? AND chat_id = ?
+        """, (MY_VK_ID, MY_CHAT_ID))
+
+        # Таблица чатов
+        cursor.execute("""
+            CREATE TABLE IF NOT EXISTS chats (
+                chat_id INTEGER PRIMARY KEY,
+                title TEXT,
+                type TEXT CHECK(type IN ('main','admin')) DEFAULT 'main'
+            )
+        """)
+
+        # Таблица команд с уровнями доступа
+        cursor.execute("""
+            CREATE TABLE IF NOT EXISTS command_restrictions (
+                command_name TEXT PRIMARY KEY,
+                required_level INTEGER NOT NULL,
+                is_disabled INTEGER DEFAULT 0,
+                modified_by INTEGER,
+                modified_at TEXT
+            )
+        """)
+
+        conn.commit()
+
+# Вызываем init_db перед любыми операциями с базой
+init_db()
+
+# -------------------- Проверяем токен --------------------
 token = "vk1.a.BD8yNPKHpTb6W0_QHq-hNpmNVjfnT0eKhexRxhkmLIQhVzPU6ULHqkcA7h5ptN03ieLd8cUKC1Mml3kN8gZpiJw4O9O7te90aVE48v55oMqV9c1EPkY6LFULpxOVj6eZqP31qplRvr9-I1TBVoquaWbv_R1NvTcm2O-eutLw7183g1RkKiUjl3Ng8RIHL1o78yAzg8rDRDEwQAsUWym2aA"
 if not token:
     print("❌ ОШИБКА: VK_BOT_TOKEN не найден в переменных окружения!")
@@ -37,7 +99,6 @@ print(f"✅ Токен загружен: {token[:20]}...")
 bot = Bot(token)
 labeler = BotLabeler()
 
-DB_PATH = "admins.db"
 
 async def extract_user_id(text: str) -> int:
     """Извлечь ID пользователя из разных форматов"""
@@ -462,10 +523,11 @@ def init_db():
     with sqlite3.connect(DB_PATH) as conn:
         cursor = conn.cursor()
 
-        # Таблица админов
+        # Таблица админов с chat_id
         cursor.execute("""
             CREATE TABLE IF NOT EXISTS admins (
-                id_vk INTEGER PRIMARY KEY,
+                id_vk INTEGER,
+                chat_id INTEGER DEFAULT 0,
                 name TEXT NOT NULL,
                 level INTEGER NOT NULL,
                 server INTEGER DEFAULT 1,
@@ -476,13 +538,21 @@ def init_db():
                 msg_count INTEGER DEFAULT 0,
                 is_in_chat INTEGER DEFAULT 1,
                 total_time_seconds REAL DEFAULT 0,
-                session_start TEXT DEFAULT ''
+                session_start TEXT DEFAULT '',
+                PRIMARY KEY(id_vk, chat_id)
             )
         """)
 
-        # Гарантируем себе 6 уровень
-        cursor.execute("INSERT OR IGNORE INTO admins (id_vk, name, level) VALUES (?, 'Мой аккаунт', 6)", (MY_VK_ID,))
-        cursor.execute("UPDATE admins SET level = 6 WHERE id_vk = ?", (MY_VK_ID,))
+        # Гарантируем себе 6 уровень для конкретного чата
+        # Укажи свой peer_id беседы вместо 2000000002
+        MY_CHAT_ID = 2000000002
+        cursor.execute("""
+            INSERT OR IGNORE INTO admins (id_vk, chat_id, name, level) 
+            VALUES (?, ?, 'Мой аккаунт', 6)
+        """, (MY_VK_ID, MY_CHAT_ID))
+        cursor.execute("""
+            UPDATE admins SET level = 6 WHERE id_vk = ? AND chat_id = ?
+        """, (MY_VK_ID, MY_CHAT_ID))
 
         # Таблица конференций
         cursor.execute("""
@@ -504,75 +574,93 @@ def init_db():
         """)
 
         # Таблицы предупреждений, заблокированных, muted, истории и т.д.
-        cursor.execute("""CREATE TABLE IF NOT EXISTS warnings (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            user_id INTEGER NOT NULL,
-            warns_count INTEGER DEFAULT 0,
-            kicks_count INTEGER DEFAULT 0
-        )""")
+        cursor.execute("""
+            CREATE TABLE IF NOT EXISTS warnings (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                user_id INTEGER NOT NULL,
+                warns_count INTEGER DEFAULT 0,
+                kicks_count INTEGER DEFAULT 0
+            )
+        """)
 
-        cursor.execute("""CREATE TABLE IF NOT EXISTS warning_history (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            user_id INTEGER NOT NULL,
-            action_type TEXT NOT NULL,
-            warns_change INTEGER NOT NULL,
-            kicks_change INTEGER DEFAULT 0,
-            reason TEXT DEFAULT '',
-            issued_by INTEGER NOT NULL,
-            issued_at TEXT NOT NULL
-        )""")
+        cursor.execute("""
+            CREATE TABLE IF NOT EXISTS warning_history (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                user_id INTEGER NOT NULL,
+                action_type TEXT NOT NULL,
+                warns_change INTEGER NOT NULL,
+                kicks_change INTEGER DEFAULT 0,
+                reason TEXT DEFAULT '',
+                issued_by INTEGER NOT NULL,
+                issued_at TEXT NOT NULL
+            )
+        """)
 
-        cursor.execute("""CREATE TABLE IF NOT EXISTS blacklisted_users (
-            user_id INTEGER PRIMARY KEY,
-            banned_at TEXT NOT NULL,
-            banned_by INTEGER NOT NULL,
-            reason TEXT DEFAULT ''
-        )""")
+        cursor.execute("""
+            CREATE TABLE IF NOT EXISTS blacklisted_users (
+                user_id INTEGER PRIMARY KEY,
+                banned_at TEXT NOT NULL,
+                banned_by INTEGER NOT NULL,
+                reason TEXT DEFAULT ''
+            )
+        """)
 
-        cursor.execute("""CREATE TABLE IF NOT EXISTS muted_users (
-            user_id INTEGER PRIMARY KEY,
-            muted_at TEXT NOT NULL,
-            muted_by INTEGER NOT NULL,
-            muted_until TEXT DEFAULT '',
-            reason TEXT DEFAULT ''
-        )""")
+        cursor.execute("""
+            CREATE TABLE IF NOT EXISTS muted_users (
+                user_id INTEGER PRIMARY KEY,
+                muted_at TEXT NOT NULL,
+                muted_by INTEGER NOT NULL,
+                muted_until TEXT DEFAULT '',
+                reason TEXT DEFAULT ''
+            )
+        """)
 
-        cursor.execute("""CREATE TABLE IF NOT EXISTS bot_settings (
-            key TEXT PRIMARY KEY,
-            value TEXT
-        )""")
+        cursor.execute("""
+            CREATE TABLE IF NOT EXISTS bot_settings (
+                key TEXT PRIMARY KEY,
+                value TEXT
+            )
+        """)
 
-        cursor.execute("""CREATE TABLE IF NOT EXISTS command_restrictions (
-            command_name TEXT PRIMARY KEY,
-            required_level INTEGER NOT NULL,
-            is_disabled INTEGER DEFAULT 0,
-            modified_by INTEGER,
-            modified_at TEXT
-        )""")
+        cursor.execute("""
+            CREATE TABLE IF NOT EXISTS command_restrictions (
+                command_name TEXT PRIMARY KEY,
+                required_level INTEGER NOT NULL,
+                is_disabled INTEGER DEFAULT 0,
+                modified_by INTEGER,
+                modified_at TEXT
+            )
+        """)
 
-        cursor.execute("""CREATE TABLE IF NOT EXISTS greetings (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            text TEXT NOT NULL,
-            wait_seconds INTEGER DEFAULT 0,
-            created_by INTEGER NOT NULL,
-            created_at TEXT NOT NULL,
-            modified_by INTEGER,
-            modified_at TEXT
-        )""")
+        cursor.execute("""
+            CREATE TABLE IF NOT EXISTS greetings (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                text TEXT NOT NULL,
+                wait_seconds INTEGER DEFAULT 0,
+                created_by INTEGER NOT NULL,
+                created_at TEXT NOT NULL,
+                modified_by INTEGER,
+                modified_at TEXT
+            )
+        """)
 
-        cursor.execute("""CREATE TABLE IF NOT EXISTS greeting_settings (
-            key TEXT PRIMARY KEY,
-            value TEXT
-        )""")
+        cursor.execute("""
+            CREATE TABLE IF NOT EXISTS greeting_settings (
+                key TEXT PRIMARY KEY,
+                value TEXT
+            )
+        """)
 
-        cursor.execute("""CREATE TABLE IF NOT EXISTS domain_history (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            user_id INTEGER NOT NULL,
-            old_domain TEXT DEFAULT '',
-            new_domain TEXT DEFAULT '',
-            changed_by INTEGER NOT NULL,
-            changed_at TEXT NOT NULL
-        )""")
+        cursor.execute("""
+            CREATE TABLE IF NOT EXISTS domain_history (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                user_id INTEGER NOT NULL,
+                old_domain TEXT DEFAULT '',
+                new_domain TEXT DEFAULT '',
+                changed_by INTEGER NOT NULL,
+                changed_at TEXT NOT NULL
+            )
+        """)
 
         conn.commit()
 

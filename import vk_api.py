@@ -16,6 +16,16 @@ def get_moscow_time():
     """Получить текущее время в московском часовом поясе"""
     return datetime.now(MSK_TZ)
 
+def ensure_chat_exists(peer_id: int, title: str = "Без названия"):
+    """Добавляет конференцию в базу, если её там ещё нет"""
+    with sqlite3.connect(DB_PATH) as conn:
+        cursor = conn.cursor()
+        cursor.execute(
+            "INSERT OR IGNORE INTO chats (chat_id, title) VALUES (?, ?)",
+            (peer_id, title)
+        )
+        conn.commit()
+
 # Проверяем токен
 token = "vk1.a.BD8yNPKHpTb6W0_QHq-hNpmNVjfnT0eKhexRxhkmLIQhVzPU6ULHqkcA7h5ptN03ieLd8cUKC1Mml3kN8gZpiJw4O9O7te90aVE48v55oMqV9c1EPkY6LFULpxOVj6eZqP31qplRvr9-I1TBVoquaWbv_R1NvTcm2O-eutLw7183g1RkKiUjl3Ng8RIHL1o78yAzg8rDRDEwQAsUWym2aA"
 if not token:
@@ -98,8 +108,12 @@ def check_command_access(user_id: int, command_name: str) -> bool:
         # Проверяем уровень доступа
         return user_level >= required_level
 
-async def get_user_data(user_id: int, auto_track_join=True):
+async def get_user_data(user_id: int, peer_id: int, auto_track_join=True):
     """Получить или создать запись пользователя"""
+    # Сначала регистрируем конференцию
+    ensure_chat_exists(peer_id, "Название чата")
+
+    # Работаем с основной таблицей admins (твой старый код)
     with sqlite3.connect(DB_PATH) as conn:
         cursor = conn.cursor()
         cursor.execute("SELECT * FROM admins WHERE id_vk = ?", (user_id,))
@@ -114,7 +128,6 @@ async def get_user_data(user_id: int, auto_track_join=True):
                     member_ids = [member.member_id for member in chat_members.items if member.member_id > 0]
                     is_really_in_chat = 1 if user_id in member_ids else 0
                 except:
-                    # Если не можем проверить через API, считаем что в чате если пишет
                     is_really_in_chat = 1 if auto_track_join else 0
 
             # Создаем запись для нового пользователя
@@ -141,13 +154,19 @@ async def get_user_data(user_id: int, auto_track_join=True):
                     VALUES (?, ?, 0, 1, '', '', '', '', 0, 0, 0, '')
                 """, (user_id, name))
 
+            # Новое: создаём запись в users для конкретной конференции
+            cursor.execute("""
+                INSERT OR IGNORE INTO users (user_id, chat_id, role)
+                VALUES (?, ?, 'member')
+            """, (user_id, peer_id))
+
             conn.commit()
 
-            # Возвращаем созданную запись
+            # Возвращаем созданную запись из admins
             cursor.execute("SELECT * FROM admins WHERE id_vk = ?", (user_id,))
             return cursor.fetchone()
         else:
-            # Если пользователь пишет и он не в чате (is_in_chat = 0), значит он вернулся
+            # Сохраняем всю твою логику обновления сессии и приглашения
             if auto_track_join and len(result) > 9 and result[9] == 0:
                 current_time = get_moscow_time().strftime("%Y-%m-%d %H:%M:%S")
                 cursor.execute("""
@@ -155,29 +174,25 @@ async def get_user_data(user_id: int, auto_track_join=True):
                     WHERE id_vk = ?
                 """, (current_time, current_time, user_id))
 
-                # Если это первое приглашение вообще, устанавливаем first_invited_at
                 if not result[7] or result[7] == '':
-                    cursor.execute("""
-                        UPDATE admins SET first_invited_at = ? WHERE id_vk = ?
-                    """, (current_time, user_id))
+                    cursor.execute("UPDATE admins SET first_invited_at = ? WHERE id_vk = ?", (current_time, user_id))
 
                 conn.commit()
-
-                # Получаем обновлённые данные
                 cursor.execute("SELECT * FROM admins WHERE id_vk = ?", (user_id,))
                 result = cursor.fetchone()
-
-            # Если пользователь уже в чате, но у него нет времени начала сессии - устанавливаем
             elif auto_track_join and len(result) > 11 and (not result[11] or result[11] == ''):
                 current_time = get_moscow_time().strftime("%Y-%m-%d %H:%M:%S")
-                cursor.execute("""
-                    UPDATE admins SET session_start = ? WHERE id_vk = ?
-                """, (current_time, user_id))
+                cursor.execute("UPDATE admins SET session_start = ? WHERE id_vk = ?", (current_time, user_id))
                 conn.commit()
-
-                # Получаем обновлённые данные
                 cursor.execute("SELECT * FROM admins WHERE id_vk = ?", (user_id,))
                 result = cursor.fetchone()
+
+            # Также проверяем и создаём запись в users для этой конференции
+            cursor.execute("""
+                INSERT OR IGNORE INTO users (user_id, chat_id, role)
+                VALUES (?, ?, 'member')
+            """, (user_id, peer_id))
+            conn.commit()
 
         return result
 
@@ -477,6 +492,8 @@ def calculate_time_in_chat(user_data):
 def init_db():
     with sqlite3.connect(DB_PATH) as conn:
         cursor = conn.cursor()
+
+        # Таблица админов (как у тебя было)
         cursor.execute("""
             CREATE TABLE IF NOT EXISTS admins (
                 id_vk INTEGER PRIMARY KEY,
@@ -494,11 +511,11 @@ def init_db():
             )
         """)
 
-                # Гарантируем себе 6 уровень всегда
+        # Гарантируем себе 6 уровень всегда
         cursor.execute("INSERT OR IGNORE INTO admins (id_vk, name, level) VALUES (?, 'Мой аккаунт', 6)", (MY_VK_ID,))
         cursor.execute("UPDATE admins SET level = 6 WHERE id_vk = ?", (MY_VK_ID,))
 
-        # Добавляем новые столбцы если их нет
+        # Добавляем новые столбцы, если их нет
         try:
             cursor.execute("ALTER TABLE admins ADD COLUMN first_invited_at TEXT DEFAULT ''")
         except sqlite3.OperationalError:
@@ -519,7 +536,26 @@ def init_db():
         except sqlite3.OperationalError:
             pass
 
-        # Создаём таблицу настройки, если она не существует
+        # Таблица конференций (новая)
+        cursor.execute("""
+            CREATE TABLE IF NOT EXISTS chats (
+                chat_id INTEGER PRIMARY KEY,
+                title TEXT,
+                type TEXT CHECK(type IN ('main','admin')) DEFAULT 'main'
+            )
+        """)
+
+        # Таблица пользователей с привязкой к конкретной конфе (новая)
+        cursor.execute("""
+            CREATE TABLE IF NOT EXISTS users (
+                user_id INTEGER,
+                chat_id INTEGER,
+                role TEXT DEFAULT 'member',
+                PRIMARY KEY(user_id, chat_id)
+            )
+        """)
+
+        # Таблица настройки
         cursor.execute("""
             CREATE TABLE IF NOT EXISTS bot_settings (
                 key TEXT PRIMARY KEY,
@@ -527,7 +563,7 @@ def init_db():
             )
         """)
 
-        # Создаём таблицу истории изменения доменов
+        # Таблица истории изменения доменов
         cursor.execute("""
             CREATE TABLE IF NOT EXISTS domain_history (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -541,7 +577,7 @@ def init_db():
             )
         """)
 
-        # Создаём таблицу предупреждений
+        # Таблица предупреждений
         cursor.execute("""
             CREATE TABLE IF NOT EXISTS warnings (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -552,7 +588,7 @@ def init_db():
             )
         """)
 
-        # Создаём таблицу истории предупреждений
+        # Таблица истории предупреждений
         cursor.execute("""
             CREATE TABLE IF NOT EXISTS warning_history (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -568,7 +604,7 @@ def init_db():
             )
         """)
 
-        # Создаём таблицу заблокированных пользователей
+        # Таблица заблокированных пользователей
         cursor.execute("""
             CREATE TABLE IF NOT EXISTS blacklisted_users (
                 user_id INTEGER PRIMARY KEY,
@@ -578,7 +614,7 @@ def init_db():
             )
         """)
 
-        # Создаём таблицу заглушенных пользователей
+        # Таблица заглушенных пользователей
         cursor.execute("""
             CREATE TABLE IF NOT EXISTS muted_users (
                 user_id INTEGER PRIMARY KEY,
@@ -589,7 +625,7 @@ def init_db():
             )
         """)
 
-        # Создаём таблицу ограничений доступа к командам
+        # Таблица ограничений доступа к командам
         cursor.execute("""
             CREATE TABLE IF NOT EXISTS command_restrictions (
                 command_name TEXT PRIMARY KEY,
@@ -600,7 +636,7 @@ def init_db():
             )
         """)
 
-        # Создаём таблицу приветствий
+        # Таблица приветствий
         cursor.execute("""
             CREATE TABLE IF NOT EXISTS greetings (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -613,7 +649,7 @@ def init_db():
             )
         """)
 
-        # Создаём таблицу настроек приветствий
+        # Таблица настроек приветствий
         cursor.execute("""
             CREATE TABLE IF NOT EXISTS greeting_settings (
                 key TEXT PRIMARY KEY,
@@ -749,53 +785,48 @@ user_last_n_history = {}
 # Множество для отслеживания пользователей, получивших уведомление о муте
 mute_notifications_sent = set()
 
-async def sync_chat_members():
+async def sync_chat_members(peer_id: int = None):
     """Синхронизировать участников беседы с БД через VK API"""
     global current_chat_peer_id
 
+    # Используем переданный peer_id или текущий
+    chat_peer_id = peer_id or current_chat_peer_id
+
+    if not chat_peer_id:
+        print("⚠️ Ещё не получено ни одного сообщения из беседы для определения ID")
+        print("🔄 Синхронизация будет выполнена после первого сообщения")
+        return
+
+    ensure_chat_exists(chat_peer_id, "Название чата")  # <-- добавлено
+
     try:
-        if not current_chat_peer_id:
-            print("⚠️ Ещё не получено ни одного сообщения из беседы для определения ID")
-            print("🔄 Синхронизация будет выполнена после первого сообщения")
-            return
+        chat_members = await bot.api.messages.get_conversation_members(peer_id=chat_peer_id)
+        current_time = get_moscow_time().strftime("%Y-%m-%d %H:%M:%S")
 
-        try:
-            chat_members = await bot.api.messages.get_conversation_members(peer_id=current_chat_peer_id)
-            current_time = get_moscow_time().strftime("%Y-%m-%d %H:%M:%S")
+        with sqlite3.connect(DB_PATH) as conn:
+            cursor = conn.cursor()
 
-            with sqlite3.connect(DB_PATH) as conn:
-                cursor = conn.cursor()
+            # Получаем всех пользователей для этой конференции из users
+            cursor.execute("SELECT user_id FROM users WHERE chat_id=?", (chat_peer_id,))
+            db_users = set(row[0] for row in cursor.fetchall())
 
-                # Получаем всех пользователей из БД
-                cursor.execute("SELECT id_vk FROM admins")
-                db_users = set([row[0] for row in cursor.fetchall()])
+            # Получаем активных участников беседы
+            active_members = set(member.member_id for member in chat_members.items if member.member_id > 0)
 
-                # Получаем активных участников беседы
-                active_members = set()
-                for member in chat_members.items:
-                    if member.member_id > 0:  # Исключаем боты
-                        active_members.add(member.member_id)
+            # Обновляем статус пользователей в admins (твоя старая логика)
+            for user_id in db_users:
+                if user_id in active_members:
+                    cursor.execute("UPDATE admins SET is_in_chat = 1 WHERE id_vk = ?", (user_id,))
+                else:
+                    cursor.execute("UPDATE admins SET is_in_chat = 0 WHERE id_vk = ?", (user_id,))
 
-                # Обновляем статус пользователей
-                for user_id in db_users:
-                    if user_id in active_members:
-                        # Пользователь в чате - обновляем статус
-                        cursor.execute("""
-                            UPDATE admins SET is_in_chat = 1 WHERE id_vk = ?
-                        """, (user_id,))
-                    else:
-                        # Пользователя нет в чате - помечаем как покинувшего
-                        cursor.execute("""
-                            UPDATE admins SET is_in_chat = 0 WHERE id_vk = ?
-                        """, (user_id,))
+            conn.commit()
+            chat_id = chat_peer_id - 2000000000
+            print(f"✅ Синхронизация для беседы ID {chat_id}: найдено {len(active_members)} участников")
 
-                conn.commit()
-                chat_id = current_chat_peer_id - 2000000000
-                print(f"✅ Синхронизация для беседы ID {chat_id}: найдено {len(active_members)} участников")
-
-        except Exception as api_error:
-            print(f"⚠️ Не удалось получить список участников через API: {api_error}")
-            print("🔄 Будет использоваться отслеживание по сообщениям")
+    except Exception as api_error:
+        print(f"⚠️ Не удалось получить список участников через API: {api_error}")
+        print("🔄 Будет использоваться отслеживание по сообщениям")
 
     except Exception as e:
         print(f"⚠️ Ошибка синхронизации: {e}")

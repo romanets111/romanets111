@@ -1,13 +1,14 @@
 import sqlite3
 import os
 import re
+import requests
 from datetime import datetime, timezone, timedelta
 from vkbottle.bot import BotLabeler, Message
 from vkbottle import Bot
 from vkbottle.bot import rules
 from vkbottle import BaseStateGroup
 
-MY_VK_ID = 407446423 # ← замени на свой VK ID!
+MY_VK_ID = 407446423  # ← замени на свой VK ID!
 
 # Московский часовой пояс
 MSK_TZ = timezone(timedelta(hours=3))
@@ -16,89 +17,21 @@ def get_moscow_time():
     """Получить текущее время в московском часовом поясе"""
     return datetime.now(MSK_TZ)
 
-def ensure_chat_exists(peer_id: int, title: str = "Без названия"):
-    """Добавляет конференцию в базу, если её там ещё нет"""
-    with sqlite3.connect(DB_PATH) as conn:
-        cursor = conn.cursor()
-        cursor.execute(
-            "INSERT OR IGNORE INTO chats (chat_id, title) VALUES (?, ?)",
-            (peer_id, title)
-        )
-        conn.commit()
-
-# -------------------- ИНИЦИАЛИЗАЦИЯ БАЗЫ --------------------
-DB_PATH = "admins.db"
-
-def init_db():
-    with sqlite3.connect(DB_PATH) as conn:
-        cursor = conn.cursor()
-
-        # Таблица админов с chat_id
-        cursor.execute("""
-            CREATE TABLE IF NOT EXISTS admins (
-                id_vk INTEGER,
-                chat_id INTEGER DEFAULT 0,
-                name TEXT NOT NULL,
-                level INTEGER NOT NULL,
-                server INTEGER DEFAULT 1,
-                domains TEXT DEFAULT '',
-                position TEXT DEFAULT '',
-                invited_at TEXT DEFAULT '',
-                first_invited_at TEXT DEFAULT '',
-                msg_count INTEGER DEFAULT 0,
-                is_in_chat INTEGER DEFAULT 1,
-                total_time_seconds REAL DEFAULT 0,
-                session_start TEXT DEFAULT '',
-                PRIMARY KEY(id_vk, chat_id)
-            )
-        """)
-
-        # Вставляем себя как админа
-        MY_CHAT_ID = 2000000002  # ID беседы, где ты админ
-        cursor.execute("""
-            INSERT OR IGNORE INTO admins (id_vk, chat_id, name, level)
-            VALUES (?, ?, 'Мой аккаунт', 6)
-        """, (MY_VK_ID, MY_CHAT_ID))
-        cursor.execute("""
-            UPDATE admins SET level = 6 WHERE id_vk = ? AND chat_id = ?
-        """, (MY_VK_ID, MY_CHAT_ID))
-
-        # Таблица чатов
-        cursor.execute("""
-            CREATE TABLE IF NOT EXISTS chats (
-                chat_id INTEGER PRIMARY KEY,
-                title TEXT,
-                type TEXT CHECK(type IN ('main','admin')) DEFAULT 'main'
-            )
-        """)
-
-        # Таблица команд с уровнями доступа
-        cursor.execute("""
-            CREATE TABLE IF NOT EXISTS command_restrictions (
-                command_name TEXT PRIMARY KEY,
-                required_level INTEGER NOT NULL,
-                is_disabled INTEGER DEFAULT 0,
-                modified_by INTEGER,
-                modified_at TEXT
-            )
-        """)
-
-        conn.commit()
-
-# Вызываем init_db перед любыми операциями с базой
-init_db()
-
-# -------------------- Проверяем токен --------------------
-token = "vk1.a.BD8yNPKHpTb6W0_QHq-hNpmNVjfnT0eKhexRxhkmLIQhVzPU6ULHqkcA7h5ptN03ieLd8cUKC1Mml3kN8gZpiJw4O9O7te90aVE48v55oMqV9c1EPkY6LFULpxOVj6eZqP31qplRvr9-I1TBVoquaWbv_R1NvTcm2O-eutLw7183g1RkKiUjl3Ng8RIHL1o78yAzg8rDRDEwQAsUWym2aA"
+# Проверяем токен
+token = "vk1.a.BD8yNPKHpTb6W0_QHq-hNpmNVjfnT0eKhexRxhkmLIQhVzPU6ULHqkcA7h5ptN03ieLd8cUKC1Mml3kN8gZpiJw4O9O7te90aVE48v55oMqV9c1EPkY6LFULpxOVj6eZqP31qplRvr9-I1TBVoquaWbv_R1NvTcm2O-eutLw7183g1RkKiUjl3Ng8RIHL1o78yAzg8rDRDEwQAsUWym2aA"  # твой токен
 if not token:
-    print("❌ ОШИБКА: VK_BOT_TOKEN не найден в переменных окружения!")
-    print("Добавьте токен в Secrets (замочек в левой панели)")
+    print("❌ ОШИБКА: VK_BOT_TOKEN не найден!")
     exit(1)
 
 print(f"✅ Токен загружен: {token[:20]}...")
 bot = Bot(token)
 labeler = BotLabeler()
 
+# 🚀 Убираем "from path.to.this.file import ..."
+# Вместо этого в конце файла делаем:
+# bot.labeler.load(rates_labeler)
+
+DB_PATH = "admins.db"
 
 async def extract_user_id(text: str) -> int:
     """Извлечь ID пользователя из разных форматов"""
@@ -136,23 +69,63 @@ async def extract_user_id(text: str) -> int:
 
     return None
 
-def get_admin_level(user_id: int, chat_id: int) -> int:
-    """Получаем уровень админа конкретной конференции"""
+# Добавляем labeler для новых команд
+rates_labeler = BotLabeler()
+
+rates_labeler = BotLabeler()
+
+import requests
+from vkbottle.bot import BotLabeler, Message
+
+rates_labeler = BotLabeler()
+
+# --- FIAT (расширенные курсы) ---
+def get_fiat_rates():
+    url = "https://open.er-api.com/v6/latest/USD"
+    try:
+        r = requests.get(url)
+        data = r.json()
+        if data.get("result") != "success":
+            print("FIAT ERROR:", data)
+            return None
+        rates = data["rates"]
+        return {
+            "EUR": rates.get("EUR"),
+            "RUB": rates.get("RUB"),
+            "CNY": rates.get("CNY"),
+            "JPY": rates.get("JPY"),
+            "GBP": rates.get("GBP"),
+            "PLN": rates.get("PLN"),  # Польша
+            "UAH": rates.get("UAH"),  # Украина
+            "BGN": rates.get("BGN"),  # Болгария
+            "RON": rates.get("RON"),  # Румыния
+            "SEK": rates.get("SEK")   # Швеция
+        }
+    except Exception as e:
+        print("FIAT ERROR:", e)
+        return None
+
+# --- CRYPTO (курсы с CoinGecko) ---
+def get_crypto_prices():
+    coins = ["bitcoin", "ethereum", "dogecoin", "binancecoin", "solana",
+             "cardano", "ripple", "polkadot", "shiba-inu", "matic-network"]
+    url = f"https://api.coingecko.com/api/v3/simple/price?ids={','.join(coins)}&vs_currencies=usd"
+    try:
+        return requests.get(url).json()
+    except Exception as e:
+        print("CRYPTO ERROR:", e)
+        return None
+
+def get_admin_level(user_id: int) -> int:
     with sqlite3.connect(DB_PATH) as conn:
         cursor = conn.cursor()
-        cursor.execute(
-            "SELECT level FROM admins WHERE id_vk = ? AND server = ?", 
-            (user_id, chat_id)
-        )
+        cursor.execute("SELECT level FROM admins WHERE id_vk = ?", (user_id,))
         result = cursor.fetchone()
         return result[0] if result else 0
 
-def check_command_access(user_id: int, command_name: str, peer_id: int) -> bool:
-    # Используем peer_id для получения уровня
-    user_level = get_admin_level(user_id, peer_id)
-    # Здесь логика проверки уровня по команде
-    required_level = COMMAND_LEVELS.get(command_name, 0)
-    return user_level >= required_level
+def check_command_access(user_id: int, command_name: str) -> bool:
+    """Проверить доступ пользователя к команде"""
+    user_level = get_admin_level(user_id)
 
     with sqlite3.connect(DB_PATH) as conn:
         cursor = conn.cursor()
@@ -176,17 +149,26 @@ def check_command_access(user_id: int, command_name: str, peer_id: int) -> bool:
         # Проверяем уровень доступа
         return user_level >= required_level
 
-async def get_user_data(user_id: int, peer_id: int, auto_track_join=True):
+async def get_user_data(user_id: int, auto_track_join=True):
     """Получить или создать запись пользователя"""
-    ensure_chat_exists(peer_id, "Название чата")
-
     with sqlite3.connect(DB_PATH) as conn:
         cursor = conn.cursor()
         cursor.execute("SELECT * FROM admins WHERE id_vk = ?", (user_id,))
         result = cursor.fetchone()
 
         if not result:
-            # Получаем имя через VK API
+            # Проверяем реально ли пользователь в чате через API
+            is_really_in_chat = 0
+            if current_chat_peer_id:
+                try:
+                    chat_members = await bot.api.messages.get_conversation_members(peer_id=current_chat_peer_id)
+                    member_ids = [member.member_id for member in chat_members.items if member.member_id > 0]
+                    is_really_in_chat = 1 if user_id in member_ids else 0
+                except:
+                    # Если не можем проверить через API, считаем что в чате если пишет
+                    is_really_in_chat = 1 if auto_track_join else 0
+
+            # Создаем запись для нового пользователя
             try:
                 user_info = await bot.api.users.get(user_ids=[user_id])
                 name = f"{user_info[0].first_name} {user_info[0].last_name}"
@@ -195,34 +177,58 @@ async def get_user_data(user_id: int, peer_id: int, auto_track_join=True):
 
             current_time = get_moscow_time().strftime("%Y-%m-%d %H:%M:%S")
 
-            cursor.execute("""
-                INSERT INTO admins (id_vk, name, level, server, domains, position, invited_at,
-                                    first_invited_at, msg_count, is_in_chat, total_time_seconds, session_start)
-                VALUES (?, ?, 0, 1, '', '', ?, ?, 1, 1, 0, ?)
-            """, (user_id, name, current_time, current_time, current_time))
+            if is_really_in_chat:
+                cursor.execute("""
+                    INSERT INTO admins (id_vk, name, level, server, domains, position, 
+                                      invited_at, first_invited_at, msg_count, is_in_chat,
+                                      total_time_seconds, session_start)
+                    VALUES (?, ?, 0, 1, '', '', ?, ?, 1, 1, 0, ?)
+                """, (user_id, name, current_time, current_time, current_time))
+            else:
+                cursor.execute("""
+                    INSERT INTO admins (id_vk, name, level, server, domains, position, 
+                                      invited_at, first_invited_at, msg_count, is_in_chat,
+                                      total_time_seconds, session_start)
+                    VALUES (?, ?, 0, 1, '', '', '', '', 0, 0, 0, '')
+                """, (user_id, name))
 
-            # Создаем запись в users
-            cursor.execute("INSERT OR IGNORE INTO users (user_id, chat_id, role) VALUES (?, ?, 'member')",
-                           (user_id, peer_id))
             conn.commit()
 
+            # Возвращаем созданную запись
             cursor.execute("SELECT * FROM admins WHERE id_vk = ?", (user_id,))
             return cursor.fetchone()
         else:
-            # Обновление сессии
-            current_time = get_moscow_time().strftime("%Y-%m-%d %H:%M:%S")
+            # Если пользователь пишет и он не в чате (is_in_chat = 0), значит он вернулся
             if auto_track_join and len(result) > 9 and result[9] == 0:
+                current_time = get_moscow_time().strftime("%Y-%m-%d %H:%M:%S")
                 cursor.execute("""
-                    UPDATE admins SET invited_at = ?, is_in_chat = 1, session_start = ? WHERE id_vk = ?
+                    UPDATE admins SET invited_at = ?, is_in_chat = 1, session_start = ?
+                    WHERE id_vk = ?
                 """, (current_time, current_time, user_id))
+
+                # Если это первое приглашение вообще, устанавливаем first_invited_at
                 if not result[7] or result[7] == '':
-                    cursor.execute("UPDATE admins SET first_invited_at = ? WHERE id_vk = ?", (current_time, user_id))
+                    cursor.execute("""
+                        UPDATE admins SET first_invited_at = ? WHERE id_vk = ?
+                    """, (current_time, user_id))
+
                 conn.commit()
 
-            # Добавляем пользователя в users для этой конференции
-            cursor.execute("INSERT OR IGNORE INTO users (user_id, chat_id, role) VALUES (?, ?, 'member')",
-                           (user_id, peer_id))
-            conn.commit()
+                # Получаем обновлённые данные
+                cursor.execute("SELECT * FROM admins WHERE id_vk = ?", (user_id,))
+                result = cursor.fetchone()
+
+            # Если пользователь уже в чате, но у него нет времени начала сессии - устанавливаем
+            elif auto_track_join and len(result) > 11 and (not result[11] or result[11] == ''):
+                current_time = get_moscow_time().strftime("%Y-%m-%d %H:%M:%S")
+                cursor.execute("""
+                    UPDATE admins SET session_start = ? WHERE id_vk = ?
+                """, (current_time, user_id))
+                conn.commit()
+
+                # Получаем обновлённые данные
+                cursor.execute("SELECT * FROM admins WHERE id_vk = ?", (user_id,))
+                result = cursor.fetchone()
 
         return result
 
@@ -522,12 +528,9 @@ def calculate_time_in_chat(user_data):
 def init_db():
     with sqlite3.connect(DB_PATH) as conn:
         cursor = conn.cursor()
-
-        # Таблица админов с chat_id
         cursor.execute("""
             CREATE TABLE IF NOT EXISTS admins (
-                id_vk INTEGER,
-                chat_id INTEGER DEFAULT 0,
+                id_vk INTEGER PRIMARY KEY,
                 name TEXT NOT NULL,
                 level INTEGER NOT NULL,
                 server INTEGER DEFAULT 1,
@@ -538,51 +541,69 @@ def init_db():
                 msg_count INTEGER DEFAULT 0,
                 is_in_chat INTEGER DEFAULT 1,
                 total_time_seconds REAL DEFAULT 0,
-                session_start TEXT DEFAULT '',
-                PRIMARY KEY(id_vk, chat_id)
+                session_start TEXT DEFAULT ''
             )
         """)
 
-        # Гарантируем себе 6 уровень для конкретного чата
-        # Укажи свой peer_id беседы вместо 2000000002
-        MY_CHAT_ID = 2000000002
-        cursor.execute("""
-            INSERT OR IGNORE INTO admins (id_vk, chat_id, name, level) 
-            VALUES (?, ?, 'Мой аккаунт', 6)
-        """, (MY_VK_ID, MY_CHAT_ID))
-        cursor.execute("""
-            UPDATE admins SET level = 6 WHERE id_vk = ? AND chat_id = ?
-        """, (MY_VK_ID, MY_CHAT_ID))
+                # Гарантируем себе 6 уровень всегда
+        cursor.execute("INSERT OR IGNORE INTO admins (id_vk, name, level) VALUES (?, 'Мой аккаунт', 6)", (MY_VK_ID,))
+        cursor.execute("UPDATE admins SET level = 6 WHERE id_vk = ?", (MY_VK_ID,))
 
-        # Таблица конференций
+        # Добавляем новые столбцы если их нет
+        try:
+            cursor.execute("ALTER TABLE admins ADD COLUMN first_invited_at TEXT DEFAULT ''")
+        except sqlite3.OperationalError:
+            pass
+
+        try:
+            cursor.execute("ALTER TABLE admins ADD COLUMN is_in_chat INTEGER DEFAULT 1")
+        except sqlite3.OperationalError:
+            pass
+
+        try:
+            cursor.execute("ALTER TABLE admins ADD COLUMN total_time_seconds REAL DEFAULT 0")
+        except sqlite3.OperationalError:
+            pass
+
+        try:
+            cursor.execute("ALTER TABLE admins ADD COLUMN session_start TEXT DEFAULT ''")
+        except sqlite3.OperationalError:
+            pass
+
+        # Создаём таблицу настройки, если она не существует
         cursor.execute("""
-            CREATE TABLE IF NOT EXISTS chats (
-                chat_id INTEGER PRIMARY KEY,
-                title TEXT,
-                type TEXT CHECK(type IN ('main','admin')) DEFAULT 'main'
+            CREATE TABLE IF NOT EXISTS bot_settings (
+                key TEXT PRIMARY KEY,
+                value TEXT
             )
         """)
 
-        # Локальные пользователи по конференциям
+        # Создаём таблицу истории изменения доменов
         cursor.execute("""
-            CREATE TABLE IF NOT EXISTS users (
-                user_id INTEGER,
-                chat_id INTEGER,
-                role TEXT DEFAULT 'member',
-                PRIMARY KEY(user_id, chat_id)
+            CREATE TABLE IF NOT EXISTS domain_history (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                user_id INTEGER NOT NULL,
+                old_domain TEXT DEFAULT '',
+                new_domain TEXT DEFAULT '',
+                changed_by INTEGER NOT NULL,
+                changed_at TEXT NOT NULL,
+                FOREIGN KEY (user_id) REFERENCES admins (id_vk),
+                FOREIGN KEY (changed_by) REFERENCES admins (id_vk)
             )
         """)
 
-        # Таблицы предупреждений, заблокированных, muted, истории и т.д.
+        # Создаём таблицу предупреждений
         cursor.execute("""
             CREATE TABLE IF NOT EXISTS warnings (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 user_id INTEGER NOT NULL,
                 warns_count INTEGER DEFAULT 0,
-                kicks_count INTEGER DEFAULT 0
+                kicks_count INTEGER DEFAULT 0,
+                FOREIGN KEY (user_id) REFERENCES admins (id_vk)
             )
         """)
 
+        # Создаём таблицу истории предупреждений
         cursor.execute("""
             CREATE TABLE IF NOT EXISTS warning_history (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -592,10 +613,13 @@ def init_db():
                 kicks_change INTEGER DEFAULT 0,
                 reason TEXT DEFAULT '',
                 issued_by INTEGER NOT NULL,
-                issued_at TEXT NOT NULL
+                issued_at TEXT NOT NULL,
+                FOREIGN KEY (user_id) REFERENCES admins (id_vk),
+                FOREIGN KEY (issued_by) REFERENCES admins (id_vk)
             )
         """)
 
+        # Создаём таблицу заблокированных пользователей
         cursor.execute("""
             CREATE TABLE IF NOT EXISTS blacklisted_users (
                 user_id INTEGER PRIMARY KEY,
@@ -605,6 +629,7 @@ def init_db():
             )
         """)
 
+        # Создаём таблицу заглушенных пользователей
         cursor.execute("""
             CREATE TABLE IF NOT EXISTS muted_users (
                 user_id INTEGER PRIMARY KEY,
@@ -615,13 +640,7 @@ def init_db():
             )
         """)
 
-        cursor.execute("""
-            CREATE TABLE IF NOT EXISTS bot_settings (
-                key TEXT PRIMARY KEY,
-                value TEXT
-            )
-        """)
-
+        # Создаём таблицу ограничений доступа к командам
         cursor.execute("""
             CREATE TABLE IF NOT EXISTS command_restrictions (
                 command_name TEXT PRIMARY KEY,
@@ -632,6 +651,7 @@ def init_db():
             )
         """)
 
+        # Создаём таблицу приветствий
         cursor.execute("""
             CREATE TABLE IF NOT EXISTS greetings (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -644,6 +664,7 @@ def init_db():
             )
         """)
 
+        # Создаём таблицу настроек приветствий
         cursor.execute("""
             CREATE TABLE IF NOT EXISTS greeting_settings (
                 key TEXT PRIMARY KEY,
@@ -651,56 +672,22 @@ def init_db():
             )
         """)
 
-        cursor.execute("""
-            CREATE TABLE IF NOT EXISTS domain_history (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                user_id INTEGER NOT NULL,
-                old_domain TEXT DEFAULT '',
-                new_domain TEXT DEFAULT '',
-                changed_by INTEGER NOT NULL,
-                changed_at TEXT NOT NULL
-            )
-        """)
+        # Добавляем базовые ограничения команд, если их нет
+        commands_with_levels = [
+            ('kick', 4), ('warn', 4), ('unwarn', 4), ('warns', 4), ('warnlist', 4),
+            ('mute', 4), ('unmute', 4), ('muted', 4), ('blocked', 4),
+            ('addadmin', 5), ('deladmin', 5), ('setposition', 5), ('getall', 5), ('unblock', 5),
+            ('dn', 3), ('admins', 3), ('top', 3),
+            ('get', 1), ('help', 1), ('mywarns', 0), ('b_date', 0), ('n_history', 2), ('accommand', 6),
+            ('greetings', 6), ('ban', 6), ('rates', 0)
+        ]
 
-        conn.commit()
-
-with sqlite3.connect(DB_PATH) as conn:
-    cursor = conn.cursor()
-
-commands_with_levels = [
-    ('kick', 4), ('warn', 4), ('unwarn', 4), ('warns', 4), ('warnlist', 4),
-    ('mute', 4), ('unmute', 4), ('muted', 4), ('blocked', 4),
-    ('addadmin', 5), ('deladmin', 5), ('setposition', 5), ('getall', 5), ('unblock', 5),
-    ('dn', 3), ('admins', 3), ('top', 3),
-    ('get', 1), ('help', 1), ('mywarns', 0), ('b_date', 0), ('n_history', 2), ('accommand', 6),
-    ('greetings', 6), ('ban', 6)
-]
-
-# Создаём словарь для быстрой проверки команд
-COMMAND_LEVELS = {cmd: level for cmd, level in commands_with_levels}
-
-for cmd, level in commands_with_levels:
+        for cmd, level in commands_with_levels:
             cursor.execute("""
                 INSERT OR IGNORE INTO command_restrictions (command_name, required_level)
                 VALUES (?, ?)
             """, (cmd, level))
 
-conn.commit()        
-
-def get_admin_level(user_id: int, chat_id: int) -> int:
-    """Получаем уровень админа конкретной конференции"""
-    with sqlite3.connect(DB_PATH) as conn:
-        cursor = conn.cursor()
-        cursor.execute("SELECT level FROM admins WHERE id_vk = ? AND server = ?", (user_id, chat_id))
-        result = cursor.fetchone()
-        return result[0] if result else 0
-    
-def ensure_chat_exists(chat_id: int, title: str, type_: str = 'main'):
-    """Гарантируем, что конференция есть в базе"""
-    with sqlite3.connect(DB_PATH) as conn:
-        cursor = conn.cursor()
-        cursor.execute("INSERT OR IGNORE INTO chats (chat_id, title, type) VALUES (?, ?, ?)",
-                       (chat_id, title, type_))
         conn.commit()
 
 async def one_time_reset_chat_users():
@@ -813,34 +800,53 @@ user_last_n_history = {}
 # Множество для отслеживания пользователей, получивших уведомление о муте
 mute_notifications_sent = set()
 
-async def sync_chat_members(peer_id: int = None):
-    chat_peer_id = peer_id or current_chat_peer_id
-    if not chat_peer_id:
-        print("⚠️ Нет ID беседы для синхронизации")
-        return
-
-    ensure_chat_exists(chat_peer_id, "Название чата")
+async def sync_chat_members():
+    """Синхронизировать участников беседы с БД через VK API"""
+    global current_chat_peer_id
 
     try:
-        chat_members = await bot.api.messages.get_conversation_members(peer_id=chat_peer_id)
-        current_time = get_moscow_time().strftime("%Y-%m-%d %H:%M:%S")
+        if not current_chat_peer_id:
+            print("⚠️ Ещё не получено ни одного сообщения из беседы для определения ID")
+            print("🔄 Синхронизация будет выполнена после первого сообщения")
+            return
 
-        with sqlite3.connect(DB_PATH) as conn:
-            cursor = conn.cursor()
+        try:
+            chat_members = await bot.api.messages.get_conversation_members(peer_id=current_chat_peer_id)
+            current_time = get_moscow_time().strftime("%Y-%m-%d %H:%M:%S")
 
-            cursor.execute("SELECT user_id FROM users WHERE chat_id=?", (chat_peer_id,))
-            db_users = set(row[0] for row in cursor.fetchall())
+            with sqlite3.connect(DB_PATH) as conn:
+                cursor = conn.cursor()
 
-            active_members = set(member.member_id for member in chat_members.items if member.member_id > 0)
+                # Получаем всех пользователей из БД
+                cursor.execute("SELECT id_vk FROM admins")
+                db_users = set([row[0] for row in cursor.fetchall()])
 
-            for user_id in db_users:
-                if user_id in active_members:
-                    cursor.execute("UPDATE admins SET is_in_chat = 1 WHERE id_vk = ?", (user_id,))
-                else:
-                    cursor.execute("UPDATE admins SET is_in_chat = 0 WHERE id_vk = ?", (user_id,))
+                # Получаем активных участников беседы
+                active_members = set()
+                for member in chat_members.items:
+                    if member.member_id > 0:  # Исключаем боты
+                        active_members.add(member.member_id)
 
-            conn.commit()
-            print(f"✅ Синхронизация беседы {chat_peer_id}: {len(active_members)} участников")
+                # Обновляем статус пользователей
+                for user_id in db_users:
+                    if user_id in active_members:
+                        # Пользователь в чате - обновляем статус
+                        cursor.execute("""
+                            UPDATE admins SET is_in_chat = 1 WHERE id_vk = ?
+                        """, (user_id,))
+                    else:
+                        # Пользователя нет в чате - помечаем как покинувшего
+                        cursor.execute("""
+                            UPDATE admins SET is_in_chat = 0 WHERE id_vk = ?
+                        """, (user_id,))
+
+                conn.commit()
+                chat_id = current_chat_peer_id - 2000000000
+                print(f"✅ Синхронизация для беседы ID {chat_id}: найдено {len(active_members)} участников")
+
+        except Exception as api_error:
+            print(f"⚠️ Не удалось получить список участников через API: {api_error}")
+            print("🔄 Будет использоваться отслеживание по сообщениям")
 
     except Exception as e:
         print(f"⚠️ Ошибка синхронизации: {e}")
@@ -863,18 +869,17 @@ async def auto_track_member_changes(message: Message):
             handle_user_leave(kicked_user_id)
             print(f"👤 Пользователь {kicked_user_id} исключён из беседы")
 
-async def send_log(message_text):
-    """Отправка логов в админский чат"""
-    await bot.api.messages.send(peer_id=LOG_CHAT_PEER_ID, message=message_text, random_id=0)
-
 @labeler.message(text="/kick <user_arg> <reason>")
 async def kick_user_with_reason(message: Message, user_arg: str, reason: str):
-    if not check_command_access(message.from_id, 'kick', message.peer_id):
+    # Проверка на целевую беседу
+    if message.peer_id != TARGET_PEER_ID:
+        return
+    if not check_command_access(message.from_id, 'kick'):
         return await message.answer("⛔ У вас нет доступа к этой команде.")
 
-    user_level = get_admin_level(message.from_id, message.peer_id)
-    id_vk = await extract_user_id(user_arg)
+    user_level = get_admin_level(message.from_id)
 
+    id_vk = await extract_user_id(user_arg)
     if not id_vk:
         return await message.answer(
             "❌ Не удалось определить ID пользователя.\n\n"
@@ -884,7 +889,7 @@ async def kick_user_with_reason(message: Message, user_arg: str, reason: str):
             "💡 Используйте: ID, @упоминание или ссылку VK"
         )
 
-    target_level = get_admin_level(id_vk, message.peer_id)
+    target_level = get_admin_level(id_vk)
     if target_level >= user_level:
         return await message.answer("⛔ Вы не можете исключить пользователя с уровнем равным или выше вашего.")
 
@@ -893,6 +898,7 @@ async def kick_user_with_reason(message: Message, user_arg: str, reason: str):
             chat_id=message.peer_id - 2000000000,
             member_id=id_vk
         )
+
         # Обновляем статус в БД
         handle_user_leave(id_vk)
 
@@ -903,19 +909,20 @@ async def kick_user_with_reason(message: Message, user_arg: str, reason: str):
             name = "Неизвестно"
 
         await message.answer(f"✅ [https://vk.com/id{id_vk}|{name}] исключён из беседы.\n📝 Причина: {reason}")
-
     except Exception as e:
         await message.answer(f"❌ Ошибка при исключении: {str(e)}")
 
-
 @labeler.message(text="/kick <user_arg>")
-async def kick_user_no_reason(message: Message, user_arg: str): 
-    if not check_command_access(message.from_id, 'kick', message.peer_id):
-     return await message.answer("⛔ У вас нет доступа к этой команде.")
+async def kick_user_no_reason(message: Message, user_arg: str):
+    # Проверка на целевую беседу
+    if message.peer_id != TARGET_PEER_ID:
+        return
+    if not check_command_access(message.from_id, 'kick'):
+        return await message.answer("⛔ У вас нет доступа к этой команде.")
 
-    user_level = get_admin_level(message.from_id, message.peer_id)
+    user_level = get_admin_level(message.from_id)
+
     id_vk = await extract_user_id(user_arg)
-
     if not id_vk:
         return await message.answer(
             "❌ Не удалось определить ID пользователя.\n\n"
@@ -925,7 +932,7 @@ async def kick_user_no_reason(message: Message, user_arg: str):
             "💡 Используйте: ID, @упоминание или ссылку VK"
         )
 
-    target_level = get_admin_level(id_vk, message.peer_id)
+    target_level = get_admin_level(id_vk)
     if target_level >= user_level:
         return await message.answer("⛔ Вы не можете исключить пользователя с уровнем равным или выше вашего.")
 
@@ -934,6 +941,8 @@ async def kick_user_no_reason(message: Message, user_arg: str):
             chat_id=message.peer_id - 2000000000,
             member_id=id_vk
         )
+
+        # Обновляем статус в БД
         handle_user_leave(id_vk)
 
         try:
@@ -943,14 +952,15 @@ async def kick_user_no_reason(message: Message, user_arg: str):
             name = "Неизвестно"
 
         await message.answer(f"✅ [https://vk.com/id{id_vk}|{name}] исключён из беседы.\n📝 Причина: не указана")
-
     except Exception as e:
         await message.answer(f"❌ Ошибка при исключении: {str(e)}")
 
-
 @labeler.message(text="/kick")
 async def kick_help(message: Message):
-    if not check_command_access(message.from_id, 'kick', message.peer_id):
+    # Проверка на целевую беседу
+    if message.peer_id != TARGET_PEER_ID:
+        return
+    if not check_command_access(message.from_id, 'kick'):
         return await message.answer("⛔ У вас нет доступа к этой команде.")
 
     await message.answer(
@@ -967,7 +977,7 @@ async def kick_help(message: Message):
 async def admins_list(message: Message, page: int):
     if message.peer_id != TARGET_PEER_ID:
         return
-    if not check_command_access(message.from_id, 'admins', message.peer_id):
+    if not check_command_access(message.from_id, 'admins'):
         return await message.answer("⛔ У вас нет доступа к этой команде.")
 
     with sqlite3.connect(DB_PATH) as conn:
@@ -992,7 +1002,7 @@ async def admins_list(message: Message, page: int):
 async def admins_missing_page(message: Message):
     if message.peer_id != TARGET_PEER_ID:
         return
-    if not check_command_access(message.from_id, 'admins', message.peer_id):
+    if not check_command_access(message.from_id, 'admins'):
         return await message.answer("⛔ У вас нет доступа к этой команде.")
     else:
         return await message.answer("❌ Ошибка: укажите номер страницы. Пример: /admins 1")
@@ -1246,7 +1256,7 @@ async def help_level(message: Message, level: int):
 async def help_usage(message: Message):
     if message.peer_id != TARGET_PEER_ID:
         return
-    if not check_command_access(message.from_id, 'help', message.peer_id):
+    if not check_command_access(message.from_id, 'help'):
         return
 
     user_level = get_admin_level(message.from_id)
@@ -1293,7 +1303,8 @@ async def help_usage(message: Message):
         'n_history': 'История изменения доменов',
         'help': 'Справка по командам',
         'mywarns': 'Ваши предупреждения',
-        'b_date': 'ТОП 5 пользователей с ближайшим днём рождения'
+        'b_date': 'ТОП 5 пользователей с ближайшим днём рождения',
+        'rates': 'Показать курс валют'
     }
 
     # Собираем доступные команды и сортируем по убыванию уровня
@@ -1333,7 +1344,7 @@ async def help_usage(message: Message):
 async def domain_history_with_page(message: Message, user_arg: str, page: int):
     if message.peer_id != TARGET_PEER_ID:
         return
-    if not check_command_access(message.from_id, 'n_history', message.peer_id):
+    if not check_command_access(message.from_id, 'n_history'):
         return await message.answer("⛔ У вас нет доступа к этой команде.")
 
     id_vk = await extract_user_id(user_arg)
@@ -1391,7 +1402,7 @@ async def domain_history_with_page(message: Message, user_arg: str, page: int):
 async def domain_history_no_page(message: Message, user_arg: str):
     if message.peer_id != TARGET_PEER_ID:
         return
-    if not check_command_access(message.from_id, 'n_history', message.peer_id):
+    if not check_command_access(message.from_id, 'n_history'):
         return await message.answer("⛔ У вас нет доступа к этой команде.")
 
     id_vk = await extract_user_id(user_arg)
@@ -1445,7 +1456,7 @@ async def domain_history_no_page(message: Message, user_arg: str):
 async def n_history_help(message: Message):
     if message.peer_id != TARGET_PEER_ID:
         return
-    if not check_command_access(message.from_id, 'n_history', message.peer_id):
+    if not check_command_access(message.from_id, 'n_history'):
         return await message.answer("⛔ У вас нет доступа к этой команде.")
 
     await message.answer(
@@ -1462,7 +1473,7 @@ async def n_history_help(message: Message):
 async def addadmin_help(message: Message, user_arg: str):
     if message.peer_id != TARGET_PEER_ID:
         return
-    if not check_command_access(message.from_id, 'addadmin', message.peer_id):
+    if not check_command_access(message.from_id, 'addadmin'):
         return await message.answer("⛔ У вас нет доступа к этой команде.")
 
     await message.answer(
@@ -1478,7 +1489,7 @@ async def addadmin_help(message: Message, user_arg: str):
 async def addadmin_missing_help(message: Message):
     if message.peer_id != TARGET_PEER_ID:
         return
-    if not check_command_access(message.from_id, 'addadmin', message.peer_id):
+    if not check_command_access(message.from_id, 'addadmin'):
         return await message.answer("⛔ У вас нет доступа к этой команде.")
 
     await message.answer(
@@ -1494,7 +1505,7 @@ async def addadmin_missing_help(message: Message):
 async def deladmin_help(message: Message):
     if message.peer_id != TARGET_PEER_ID:
         return
-    if not check_command_access(message.from_id, 'deladmin', message.peer_id):
+    if not check_command_access(message.from_id, 'deladmin'):
         return await message.answer("⛔ У вас нет доступа к этой команде.")
 
     await message.answer(
@@ -1512,7 +1523,7 @@ async def deladmin_help(message: Message):
 async def setposition_help(message: Message, user_arg: str):
     if message.peer_id != TARGET_PEER_ID:
         return
-    if not check_command_access(message.from_id, 'setposition', message.peer_id):
+    if not check_command_access(message.from_id, 'setposition'):
         return await message.answer("⛔ У вас нет доступа к этой команде.")
 
     await message.answer(
@@ -1528,7 +1539,7 @@ async def setposition_help(message: Message, user_arg: str):
 async def setposition_missing_help(message: Message):
     if message.peer_id != TARGET_PEER_ID:
         return
-    if not check_command_access(message.from_id, 'setposition', message.peer_id):
+    if not check_command_access(message.from_id, 'setposition'):
         return await message.answer("⛔ У вас нет доступа к этой команде.")
 
     await message.answer(
@@ -1544,7 +1555,7 @@ async def setposition_missing_help(message: Message):
 async def dn_consist_list(message: Message):
     if message.peer_id != TARGET_PEER_ID:
         return
-    if not check_command_access(message.from_id, 'dn', message.peer_id):
+    if not check_command_access(message.from_id, 'dn'):
         return await message.answer("⛔ У вас нет доступа к этой команде.")
 
     with sqlite3.connect(DB_PATH) as conn:
@@ -1882,7 +1893,7 @@ async def get_all_users(message: Message):
 async def warn_user_with_reason(message: Message, user_arg: str, warns_count: int, reason: str):
     if message.peer_id != TARGET_PEER_ID:
         return
-    if not check_command_access(message.from_id, 'warn', message.peer_id):
+    if not check_command_access(message.from_id, 'warn'):
         return await message.answer("⛔ У вас нет доступа к этой команде.")
     user_level = get_admin_level(message.from_id)
 
@@ -2010,7 +2021,7 @@ async def warn_user_no_reason(message: Message, user_arg: str, warns_count: int)
 async def warn_help(message: Message):
     if message.peer_id != TARGET_PEER_ID:
         return
-    if not check_command_access(message.from_id, 'warn', message.peer_id):
+    if not check_command_access(message.from_id, 'warn'):
         return await message.answer("⛔ У вас нет доступа к этой команде.")
 
     await message.answer("ABot » Использование: /warn <Ссылка на профиль> <Кол-во пред.> <Причина>")
@@ -2019,7 +2030,7 @@ async def warn_help(message: Message):
 async def unwarn_user_with_reason(message: Message, user_arg: str, warns_count: int, reason: str):
     if message.peer_id != TARGET_PEER_ID:
         return
-    if not check_command_access(message.from_id, 'unwarn', message.peer_id):
+    if not check_command_access(message.from_id, 'unwarn'):
         return await message.answer("⛔ У вас нет доступа к этой команде.")
 
     if warns_count <= 0:
@@ -2124,7 +2135,7 @@ async def unwarn_user_no_reason(message: Message, user_arg: str, warns_count: in
 async def unwarn_help(message: Message):
     if message.peer_id != TARGET_PEER_ID:
         return
-    if not check_command_access(message.from_id, 'unwarn', message.peer_id):
+    if not check_command_access(message.from_id, 'unwarn'):
         return await message.answer("❌ У вас нет доступа к этой команде.")
 
     await message.answer("ABot » Использование: /unwarn <Ссылка на профиль> <Кол-во пред.> <Причина (Необязательно)>")
@@ -2133,7 +2144,7 @@ async def unwarn_help(message: Message):
 async def warns_list_with_page(message: Message, page: int):
     if message.peer_id != TARGET_PEER_ID:
         return
-    if not check_command_access(message.from_id, 'warns', message.peer_id):
+    if not check_command_access(message.from_id, 'warns'):
         return await message.answer("⛔ У вас нет доступа к этой команде.")
 
     with sqlite3.connect(DB_PATH) as conn:
@@ -2168,7 +2179,7 @@ async def warns_list_with_page(message: Message, page: int):
 
 @labeler.message(text="/warns")
 async def warns_list_first_page(message: Message):
-    if not check_command_access(message.from_id, 'warns', message.peer_id):
+    if not check_command_access(message.from_id, 'warns'):
         return await message.answer("⛔ У вас нет доступа к этой команде.")
     await warns_list_with_page(message, 1)
 
@@ -2176,7 +2187,7 @@ async def warns_list_first_page(message: Message):
 async def warnlist_with_page(message: Message, user_arg: str, page: int):
     if message.peer_id != TARGET_PEER_ID:
         return
-    if not check_command_access(message.from_id, 'warnlist', message.peer_id):
+    if not check_command_access(message.from_id, 'warnlist'):
         return await message.answer("⛔ У вас нет доступа к этой команде.")
 
     id_vk = await extract_user_id(user_arg)
@@ -2241,7 +2252,7 @@ async def warnlist_with_page(message: Message, user_arg: str, page: int):
 
 @labeler.message(text="/warnlist <user_arg>")
 async def warnlist_first_page(message: Message, user_arg: str):
-    if not check_command_access(message.from_id, 'warnlist', message.peer_id):
+    if not check_command_access(message.from_id, 'warnlist'):
         return await message.answer("⛔ У вас нет доступа к этой команде.")
     await warnlist_with_page(message, user_arg, 1)
 
@@ -2249,7 +2260,7 @@ async def warnlist_first_page(message: Message, user_arg: str):
 async def warnlist_help(message: Message):
     if message.peer_id != TARGET_PEER_ID:
         return
-    if not check_command_access(message.from_id, 'warnlist', message.peer_id):
+    if not check_command_access(message.from_id, 'warnlist'):
         return await message.answer("❌ У вас нет доступа к этой команде.")
 
     await message.answer("ABot » Использование: /warnlist <Ссылка на профиль> <Страница (Необязательно)>")
@@ -2333,7 +2344,9 @@ async def my_warns_first_page(message: Message):
 
 @labeler.message(text="/unblock <user_arg> <reason>")
 async def unblock_user_with_reason(message: Message, user_arg: str, reason: str):
-    if not check_command_access(message.from_id, 'unblock', message.peer_id):
+    if message.peer_id != TARGET_PEER_ID:
+        return
+    if not check_command_access(message.from_id, 'unblock'):
         return await message.answer("❌ У вас нет прав разблокировать пользователей.")
 
     id_vk = await extract_user_id(user_arg)
@@ -2346,42 +2359,49 @@ async def unblock_user_with_reason(message: Message, user_arg: str, reason: str)
             "/unblock @id123456789 Реабилитация"
         )
 
-    current_time = get_moscow_time().strftime("%d.%m.%Y %H:%M:%S")
-
-    with sqlite3.connect(DB_PATH) as conn:
-        cursor = conn.cursor()
-        cursor.execute("SELECT banned_at FROM blacklisted_users WHERE user_id = ?", (id_vk,))
-        if not cursor.fetchone():
-            return await message.answer(f"❌ Пользователь с ID {id_vk} не находится в чёрном списке.")
-
-        cursor.execute("DELETE FROM blacklisted_users WHERE user_id = ?", (id_vk,))
-        cursor.execute("UPDATE warnings SET warns_count = 0, kicks_count = 0 WHERE user_id = ?", (id_vk,))
-        cursor.execute(
-            "INSERT INTO warning_history (user_id, action_type, warns_change, kicks_change, reason, issued_by, issued_at) VALUES (?, 'unblock', 0, 0, ?, ?, ?)",
-            (id_vk, reason, message.from_id, current_time)
-        )
-        conn.commit()
-
     try:
         user_info = await bot.api.users.get(user_ids=[id_vk])
         name = f"{user_info[0].first_name} {user_info[0].last_name}"
     except:
         name = "Неизвестно"
 
-    await message.answer(
-        f"✅ [https://vk.com/id{id_vk}|{name}] разблокирован и может быть приглашён в беседу\n"
-        f"📝 Причина разблокировки: {reason}\n🔄 Все предупреждения и выговоры сброшены"
-    )
+    current_time = get_moscow_time().strftime("%d.%m.%Y %H:%M:%S")
 
+    with sqlite3.connect(DB_PATH) as conn:
+        cursor = conn.cursor()
+
+        # Проверяем, заблокирован ли пользователь
+        cursor.execute("SELECT banned_at FROM blacklisted_users WHERE user_id = ?", (id_vk,))
+        blocked = cursor.fetchone()
+
+        if not blocked:
+            return await message.answer(f"❌ [https://vk.com/id{id_vk}|{name}] не находится в чёрном списке.")
+
+        # Убираем из чёрного списка
+        cursor.execute("DELETE FROM blacklisted_users WHERE user_id = ?", (id_vk,))
+
+        # Сбрасываем предупреждения и выговоры
+        cursor.execute("UPDATE warnings SET warns_count = 0, kicks_count = 0 WHERE user_id = ?", (id_vk,))
+
+        # Записываем в историю разблокировки
+        cursor.execute("""
+            INSERT INTO warning_history (user_id, action_type, warns_change, kicks_change, reason, issued_by, issued_at)
+            VALUES (?, 'unblock', 0, 0, ?, ?, ?)
+        """, (id_vk, reason, message.from_id, current_time))
+
+        conn.commit()
+
+    await message.answer(f"✅ [https://vk.com/id{id_vk}|{name}] разблокирован и может быть приглашён в беседу\n📝 Причина разблокировки: {reason}\n🔄 Все предупреждения и выговоры сброшены")
 
 @labeler.message(text="/unblock <user_arg>")
 async def unblock_user_no_reason(message: Message, user_arg: str):
     await unblock_user_with_reason(message, user_arg, "не указана")
 
-
 @labeler.message(text="/unblock")
 async def unblock_help(message: Message):
-    if not check_command_access(message.from_id, 'unblock', message.peer_id):
+    if message.peer_id != TARGET_PEER_ID:
+        return
+    if not check_command_access(message.from_id, 'unblock'):
         return await message.answer("❌ У вас нет прав разблокировать пользователей.")
 
     await message.answer(
@@ -2398,7 +2418,7 @@ async def unblock_help(message: Message):
 async def blocked_list(message: Message):
     if message.peer_id != TARGET_PEER_ID:
         return
-    if not check_command_access(message.from_id, 'blocked', message.peer_id):
+    if not check_command_access(message.from_id, 'blocked'):
         return await message.answer("❌ У вас нет доступа к этой команде.")
 
     with sqlite3.connect(DB_PATH) as conn:
@@ -2436,7 +2456,7 @@ async def blocked_list(message: Message):
 async def mute_user_with_duration_reason(message: Message, user_arg: str, duration: str, reason: str):
     if message.peer_id != TARGET_PEER_ID:
         return
-    if not check_command_access(message.from_id, 'mute', message.peer_id):
+    if not check_command_access(message.from_id, 'mute'):
         return await message.answer("❌ У вас нет прав заглушать пользователей.")
 
     id_vk = await extract_user_id(user_arg)
@@ -2542,7 +2562,7 @@ async def mute_user_with_duration(message: Message, user_arg: str, duration: str
 async def mute_user_no_duration(message: Message, user_arg: str):
     if message.peer_id != TARGET_PEER_ID:
         return
-    if not check_command_access(message.from_id, 'mute', message.peer_id):
+    if not check_command_access(message.from_id, 'mute'):
         return await message.answer("❌ У вас нет прав заглушать пользователей.")
 
     await message.answer(
@@ -2564,7 +2584,7 @@ async def mute_user_no_duration(message: Message, user_arg: str):
 async def mute_help(message: Message):
     if message.peer_id != TARGET_PEER_ID:
         return
-    if not check_command_access(message.from_id, 'mute', message.peer_id):
+    if not check_command_access(message.from_id, 'mute'):
         return await message.answer("❌ У вас нет прав заглушать пользователей.")
 
     await message.answer(
@@ -2586,7 +2606,7 @@ async def mute_help(message: Message):
 async def unmute_user_with_reason(message: Message, user_arg: str, reason: str):
     if message.peer_id != TARGET_PEER_ID:
         return
-    if not check_command_access(message.from_id, 'unmute', message.peer_id):
+    if not check_command_access(message.from_id, 'unmute'):
         return await message.answer("❌ У вас нет прав снимать заглушку с пользователей.")
 
     id_vk = await extract_user_id(user_arg)
@@ -2635,7 +2655,7 @@ async def unmute_user_no_reason(message: Message, user_arg: str):
 async def unmute_help(message: Message):
     if message.peer_id != TARGET_PEER_ID:
         return
-    if not check_command_access(message.from_id, 'unmute', message.peer_id):
+    if not check_command_access(message.from_id, 'unmute'):
         return await message.answer("❌ У вас нет прав снимать заглушку с пользователей.")
 
     await message.answer(
@@ -2652,7 +2672,7 @@ async def unmute_help(message: Message):
 async def muted_list(message: Message):
     if message.peer_id != TARGET_PEER_ID:
         return
-    if not check_command_access(message.from_id, 'muted', message.peer_id):
+    if not check_command_access(message.from_id, 'muted'):
         return await message.answer("❌ У вас нет доступа к этой команде.")
 
     current_time = get_moscow_time()
@@ -2723,7 +2743,7 @@ async def muted_list(message: Message):
 async def top_users_with_page(message: Message, page: int):
     if message.peer_id != TARGET_PEER_ID:
         return
-    if not check_command_access(message.from_id, 'top', message.peer_id):
+    if not check_command_access(message.from_id, 'top'):
         return await message.answer("❌ У вас нет доступа к этой команде.")
 
     with sqlite3.connect(DB_PATH) as conn:
@@ -2831,7 +2851,7 @@ async def b_date_command(message: Message):
 async def top_users_first_page(message: Message):
     if message.peer_id != TARGET_PEER_ID:
         return
-    if not check_command_access(message.from_id, 'top', message.peer_id):
+    if not check_command_access(message.from_id, 'top'):
         return await message.answer("❌ У вас нет доступа к этой команде.")
     await top_users_with_page(message, 1)
 
@@ -2839,7 +2859,7 @@ async def top_users_first_page(message: Message):
 async def accommand_list(message: Message):
     if message.peer_id != TARGET_PEER_ID:
         return
-    if not check_command_access(message.from_id, 'accommand', message.peer_id):
+    if not check_command_access(message.from_id, 'accommand'):
         return await message.answer("⛔ У вас нет доступа к этой команде.")
 
     with sqlite3.connect(DB_PATH) as conn:
@@ -2871,7 +2891,7 @@ async def accommand_list(message: Message):
 async def accommand_set_level(message: Message, command: str, level: int):
     if message.peer_id != TARGET_PEER_ID:
         return
-    if not check_command_access(message.from_id, 'accommand', message.peer_id):
+    if not check_command_access(message.from_id, 'accommand'):
         return await message.answer("⛔ У вас нет доступа к этой команде.")
 
     if level < 0 or level > 6:
@@ -2894,7 +2914,7 @@ async def accommand_set_level(message: Message, command: str, level: int):
 async def accommand_disable(message: Message, command: str):
     if message.peer_id != TARGET_PEER_ID:
         return
-    if not check_command_access(message.from_id, 'accommand', message.peer_id):
+    if not check_command_access(message.from_id, 'accommand'):
         return await message.answer("⛔ У вас нет доступа к этой команде.")
 
     current_time = get_moscow_time().strftime("%Y-%m-%d %H:%M:%S")
@@ -2914,7 +2934,7 @@ async def accommand_disable(message: Message, command: str):
 async def accommand_enable(message: Message, command: str):
     if message.peer_id != TARGET_PEER_ID:
         return
-    if not check_command_access(message.from_id, 'accommand', message.peer_id):
+    if not check_command_access(message.from_id, 'accommand'):
         return await message.answer("⛔ У вас нет доступа к этой команде.")
 
     current_time = get_moscow_time().strftime("%Y-%m-%d %H:%M:%S")
@@ -2938,7 +2958,7 @@ async def accommand_enable(message: Message, command: str):
 async def accommand_help(message: Message):
     if message.peer_id != TARGET_PEER_ID:
         return
-    if not check_command_access(message.from_id, 'accommand', message.peer_id):
+    if not check_command_access(message.from_id, 'accommand'):
         return await message.answer("⛔ У вас нет доступа к этой команде.")
 
     await message.answer(
@@ -2954,11 +2974,51 @@ async def accommand_help(message: Message):
         "/accommand enable warn - Включить команду /warn"
     )
 
+@rates_labeler.message(text="/rates")
+async def rates_handler(message: Message):
+    fiat = get_fiat_rates()
+    crypto = get_crypto_prices()
+
+    if not fiat or not crypto:
+        await message.answer("❌ Ошибка при получении данных")
+        return
+
+    msg = "📊 Курсы валют:\n"
+    msg += f"💶 EUR: 1 USD = {fiat['EUR']:.2f} EUR\n"
+    msg += f"₽ RUB: 1 USD = {fiat['RUB']:.2f} RUB\n"
+    msg += f"💴 CNY: 1 USD = {fiat['CNY']:.2f} CNY\n"
+    msg += f"💴 JPY: 1 USD = {fiat['JPY']:.2f} JPY\n"
+    msg += f"💷 GBP: 1 USD = {fiat['GBP']:.2f} GBP\n"
+    msg += f"🇵🇱 PLN: 1 USD = {fiat['PLN']:.2f} PLN\n"
+    msg += f"🇺🇦 UAH: 1 USD = {fiat['UAH']:.2f} UAH\n"
+    msg += f"🇧🇬 BGN: 1 USD = {fiat['BGN']:.2f} BGN\n"
+    msg += f"🇷🇴 RON: 1 USD = {fiat['RON']:.2f} RON\n"
+    msg += f"🇸🇪 SEK: 1 USD = {fiat['SEK']:.2f} SEK\n\n\n"
+
+    msg += "📈 Курсы крипты (USD):\n"
+    msg += f"₿ Bitcoin: ${crypto['bitcoin']['usd']:.2f}\n"
+    msg += f"◆ Ethereum: ${crypto['ethereum']['usd']:.2f}\n"
+    msg += f"🐶 Dogecoin: ${crypto['dogecoin']['usd']:.2f}\n"
+    msg += f"🟡 BNB: ${crypto['binancecoin']['usd']:.2f}\n"
+    msg += f"🌞 Solana: ${crypto['solana']['usd']:.2f}\n"
+    msg += f"🔷 Cardano: ${crypto['cardano']['usd']:.2f}\n"
+    msg += f"💧 XRP: ${crypto['ripple']['usd']:.2f}\n"
+    msg += f"🕸 Polkadot: ${crypto['polkadot']['usd']:.2f}\n"
+    msg += f"🐕 Shiba: ${crypto['shiba-inu']['usd']:.8f}\n"
+    msg += f"🔹 Matic: ${crypto['matic-network']['usd']:.2f}\n"
+
+    await message.answer(msg)
+
+# =====================================
+# В самом конце файла подключаем новый labeler:
+# =====================================
+bot.labeler.load(rates_labeler)
+
 @labeler.message(text="/greetings add <greeting_text>")
 async def greetings_add(message: Message, greeting_text: str):
     if message.peer_id != TARGET_PEER_ID:
         return
-    if not check_command_access(message.from_id, 'greetings', message.peer_id):
+    if not check_command_access(message.from_id, 'greetings'):
         return await message.answer("⛔ У вас нет доступа к этой команде.")
 
     current_time = get_moscow_time().strftime("%d.%m.%Y %H:%M:%S")
@@ -2979,7 +3039,7 @@ async def greetings_add(message: Message, greeting_text: str):
 async def greetings_set_active(message: Message, greeting_id: int):
     if message.peer_id != TARGET_PEER_ID:
         return
-    if not check_command_access(message.from_id, 'greetings', message.peer_id):
+    if not check_command_access(message.from_id, 'greetings'):
         return await message.answer("⛔ У вас нет доступа к этой команде.")
 
     with sqlite3.connect(DB_PATH) as conn:
@@ -3006,7 +3066,7 @@ async def greetings_set_active(message: Message, greeting_id: int):
 async def greetings_set_wait(message: Message, greeting_id: int, wait_seconds: int):
     if message.peer_id != TARGET_PEER_ID:
         return
-    if not check_command_access(message.from_id, 'greetings', message.peer_id):
+    if not check_command_access(message.from_id, 'greetings'):
         return await message.answer("⛔ У вас нет доступа к этой команде.")
 
     if wait_seconds < 0 or wait_seconds > 300:
@@ -3038,7 +3098,7 @@ async def greetings_set_wait(message: Message, greeting_id: int, wait_seconds: i
 async def greetings_edit(message: Message, greeting_id: int, new_text: str):
     if message.peer_id != TARGET_PEER_ID:
         return
-    if not check_command_access(message.from_id, 'greetings', message.peer_id):
+    if not check_command_access(message.from_id, 'greetings'):
         return await message.answer("⛔ У вас нет доступа к этой команде.")
 
     current_time = get_moscow_time().strftime("%d.%m.%Y %H:%M:%S")
@@ -3067,7 +3127,7 @@ async def greetings_edit(message: Message, greeting_id: int, new_text: str):
 async def greetings_get_active(message: Message):
     if message.peer_id != TARGET_PEER_ID:
         return
-    if not check_command_access(message.from_id, 'greetings', message.peer_id):
+    if not check_command_access(message.from_id, 'greetings'):
         return await message.answer("⛔ У вас нет доступа к этой команде.")
 
     with sqlite3.connect(DB_PATH) as conn:
@@ -3120,7 +3180,7 @@ async def greetings_get_active(message: Message):
 async def greetings_get_specific(message: Message, greeting_id: int):
     if message.peer_id != TARGET_PEER_ID:
         return
-    if not check_command_access(message.from_id, 'greetings', message.peer_id):
+    if not check_command_access(message.from_id, 'greetings'):
         return await message.answer("⛔ У вас нет доступа к этой команде.")
 
     with sqlite3.connect(DB_PATH) as conn:
@@ -3171,7 +3231,7 @@ async def greetings_get_specific(message: Message, greeting_id: int):
 async def greetings_list_with_page(message: Message, page: int):
     if message.peer_id != TARGET_PEER_ID:
         return
-    if not check_command_access(message.from_id, 'greetings', message.peer_id):
+    if not check_command_access(message.from_id, 'greetings'):
         return await message.answer("⛔ У вас нет доступа к этой команде.")
 
     with sqlite3.connect(DB_PATH) as conn:
@@ -3226,7 +3286,7 @@ async def greetings_list_first_page(message: Message):
 async def greetings_help(message: Message):
     if message.peer_id != TARGET_PEER_ID:
         return
-    if not check_command_access(message.from_id, 'greetings', message.peer_id):
+    if not check_command_access(message.from_id, 'greetings'):
         return await message.answer("⛔ У вас нет доступа к этой команде.")
 
     await message.answer(
@@ -3244,12 +3304,15 @@ async def greetings_help(message: Message):
         "⏰ Время ожидания: от 0 до 300 секунд"
     )
 
+# 🚫 СИСТЕМНЫЙ БАН - ПОЛНАЯ БЛОКИРОВКА ПОЛЬЗОВАТЕЛЯ
 @labeler.message(text="/ban <user_arg> <reason>")
 async def ban_user_with_reason(message: Message, user_arg: str, reason: str):
-    if not check_command_access(message.from_id, 'ban', message.peer_id):
+    if message.peer_id != TARGET_PEER_ID:
+        return
+    if not check_command_access(message.from_id, 'ban'):
         return await message.answer("⛔ У вас нет доступа к этой команде.")
 
-    user_level = get_admin_level(message.from_id, message.peer_id)
+    user_level = get_admin_level(message.from_id)
     id_vk = await extract_user_id(user_arg)
 
     if not id_vk:
@@ -3258,10 +3321,10 @@ async def ban_user_with_reason(message: Message, user_arg: str, reason: str):
             "📝 Использование команды:\n"
             "/ban <Пользователь> <Причина>\n\n"
             "💡 Пример:\n"
-            "/ban @id123456789 Спам"
+            "/ban @id123456789 сжшник"
         )
 
-    target_level = get_admin_level(id_vk, message.peer_id)
+    target_level = get_admin_level(id_vk)
     if target_level >= user_level:
         return await message.answer("⛔ Вы не можете заблокировать пользователя с уровнем равным или выше вашего.")
 
@@ -3269,19 +3332,29 @@ async def ban_user_with_reason(message: Message, user_arg: str, reason: str):
 
     with sqlite3.connect(DB_PATH) as conn:
         cursor = conn.cursor()
-        cursor.execute("SELECT banned_at FROM blacklisted_users WHERE user_id = ?", (id_vk,))
-        if cursor.fetchone():
-            return await message.answer(f"❌ Пользователь уже заблокирован.")
 
-        cursor.execute(
-            "INSERT INTO blacklisted_users (user_id, banned_at, banned_by, reason) VALUES (?, ?, ?, ?)",
-            (id_vk, current_time, message.from_id, reason)
-        )
+        # Проверяем, не заблокирован ли пользователь уже
+        cursor.execute("SELECT banned_at FROM blacklisted_users WHERE user_id = ?", (id_vk,))
+        is_blocked = cursor.fetchone()
+
+        if is_blocked:
+            return await message.answer(f"❌ Пользователь с ID {id_vk} уже заблокирован.")
+
+        # Добавляем в чёрный список
+        cursor.execute("""
+            INSERT INTO blacklisted_users (user_id, banned_at, banned_by, reason)
+            VALUES (?, ?, ?, ?)
+        """, (id_vk, current_time, message.from_id, reason))
+
+        # Обновляем предупреждения и выговоры
         cursor.execute("UPDATE warnings SET warns_count = 0, kicks_count = 0 WHERE user_id = ?", (id_vk,))
-        cursor.execute(
-            "INSERT INTO warning_history (user_id, action_type, warns_change, kicks_change, reason, issued_by, issued_at) VALUES (?, 'ban', 0, 0, ?, ?, ?)",
-            (id_vk, reason, message.from_id, current_time)
-        )
+
+        # Записываем в историю блокировки
+        cursor.execute("""
+            INSERT INTO warning_history (user_id, action_type, warns_change, kicks_change, reason, issued_by, issued_at)
+            VALUES (?, 'ban', 0, 0, ?, ?, ?)
+        """, (id_vk, reason, message.from_id, current_time))
+
         conn.commit()
 
     try:
@@ -3292,15 +3365,15 @@ async def ban_user_with_reason(message: Message, user_arg: str, reason: str):
 
     await message.answer(f"🚫 Пользователь [https://vk.com/id{id_vk}|{name}] заблокирован!\n📝 Причина: {reason}")
 
-
 @labeler.message(text="/ban <user_arg>")
 async def ban_user_no_reason(message: Message, user_arg: str):
     await ban_user_with_reason(message, user_arg, "не указана")
 
-
 @labeler.message(text="/ban")
 async def ban_help(message: Message):
-    if not check_command_access(message.from_id, 'ban', message.peer_id):
+    if message.peer_id != TARGET_PEER_ID:
+        return
+    if not check_command_access(message.from_id, 'ban'):
         return await message.answer("⛔ У вас нет доступа к этой команде.")
 
     await message.answer(
@@ -3308,7 +3381,7 @@ async def ban_help(message: Message):
         "/ban <Пользователь> <Причина>\n\n"
         "💡 Пример использования:\n"
         "/ban @id123456789 Нарушение правил\n"
-        "/ban 123456789 Спам\n"
+        "/ban 123456789 сжшник\n"
         "/ban https://vk.com/id123456789 Спам"
     )
 
@@ -3476,7 +3549,7 @@ async def track_all_messages_final(message: Message):
     await auto_track_member_changes(message)
 
     # Обновляем данные пользователя
-    await get_user_data(message.from_id, message.peer_id)
+    await get_user_data(message.from_id)
 
     # Увеличиваем счётчик сообщений
     update_message_count(message.from_id)
